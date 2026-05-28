@@ -7,6 +7,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -175,7 +177,32 @@ def tool_read_file(
 
     abs_path = _assert_safe_path(project_root, path)
     if not abs_path.exists():
-        raise ToolError(f"File not found: {path}")
+        # If path has no extension, try common code extensions then rglob
+        if not abs_path.suffix:
+            _exts = (".kt", ".java", ".xml", ".kts", ".toml", ".py", ".gradle")
+            for ext in _exts:
+                candidate = abs_path.with_name(abs_path.name + ext)
+                if candidate.is_file():
+                    abs_path = candidate
+                    path = str(candidate.relative_to(project_root))
+                    break
+            else:
+                # Fall back to rglob by name
+                hits = list(project_root.rglob(abs_path.name + ".*"))
+                code_hits = [h for h in hits if h.suffix in _exts]
+                if code_hits:
+                    abs_path = code_hits[0]
+                    path = str(abs_path.relative_to(project_root))
+                else:
+                    raise ToolError(f"File not found: {path}")
+        else:
+            # Try rglob by filename in case the path prefix is wrong
+            hits = list(project_root.rglob(abs_path.name))
+            if hits:
+                abs_path = hits[0]
+                path = str(abs_path.relative_to(project_root))
+            else:
+                raise ToolError(f"File not found: {path}")
     if not abs_path.is_file():
         raise ToolError(f"Not a file: {path}")
 
@@ -695,6 +722,93 @@ def tool_android_docs_validate(
 
 
 # ---------------------------------------------------------------------------
+# web_search  (internet; HITL-required)
+# ---------------------------------------------------------------------------
+
+def tool_web_search(
+    query: str,
+    max_results: int = 5,
+    hitl_enabled: bool = False,
+) -> list[dict]:
+    """
+    Lightweight web search using DuckDuckGo Instant Answer API.
+
+    This tool is intentionally gated: it can run only when HITL is enabled.
+    """
+    if not hitl_enabled:
+        raise ToolError(
+            "web_search requires HITL. Re-run chat/ask with --hitl to enable internet search."
+        )
+    q = (query or "").strip()
+    if not q:
+        raise ToolError("web_search: query is required")
+    max_results = max(1, min(max_results, 10))
+
+    url = (
+        "https://api.duckduckgo.com/?"
+        + urllib.parse.urlencode(
+            {
+                "q": q,
+                "format": "json",
+                "no_html": "1",
+                "no_redirect": "1",
+                "skip_disambig": "1",
+            }
+        )
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "codescope/0.1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as e:
+        raise ToolError(f"web_search failed: {e}")
+
+    results: list[dict] = []
+
+    # Primary abstract result (if present)
+    if data.get("AbstractURL"):
+        results.append(
+            {
+                "title": data.get("Heading") or q,
+                "url": data.get("AbstractURL"),
+                "snippet": (data.get("AbstractText") or "").strip(),
+                "source": "duckduckgo",
+            }
+        )
+
+    def _add_topic(topic: dict) -> None:
+        if len(results) >= max_results:
+            return
+        u = topic.get("FirstURL")
+        t = topic.get("Text")
+        if not u or not t:
+            return
+        results.append(
+            {
+                "title": t.split(" - ")[0][:120],
+                "url": u,
+                "snippet": t[:280],
+                "source": "duckduckgo",
+            }
+        )
+
+    # Flat and nested related topics
+    for item in data.get("RelatedTopics", []) or []:
+        if len(results) >= max_results:
+            break
+        if isinstance(item, dict) and "Topics" in item:
+            for t in item.get("Topics") or []:
+                if isinstance(t, dict):
+                    _add_topic(t)
+        elif isinstance(item, dict):
+            _add_topic(item)
+
+    if not results:
+        return [{"note": f"No web results found for {q!r}."}]
+    return results[:max_results]
+
+
+# ---------------------------------------------------------------------------
 # git_diff / git_log
 # ---------------------------------------------------------------------------
 
@@ -838,6 +952,7 @@ TOOL_REGISTRY = {
     "docs_lookup":     tool_docs_lookup,
     "android_docs":           tool_android_docs,
     "android_docs_validate":  tool_android_docs_validate,
+    "web_search":      tool_web_search,
 }
 
 
@@ -864,8 +979,28 @@ def normalize_tool_args(tool_name: str, args: dict) -> dict:
         if "query" in args and "file" not in args:
             args.setdefault("query", args["query"])
 
+    if tool_name == "graph_lookup":
+        # LLMs often pass "path", "id", or "file_path" — normalise to "file" or "node"
+        for alias in ("path", "file_path", "filepath"):
+            if alias in args and "file" not in args and "node" not in args:
+                val = args.pop(alias)
+                # Looks like a file path if it contains a slash or has a code extension
+                if "/" in str(val) or "." in str(val):
+                    args["file"] = val
+                else:
+                    args["node"] = val
+                break
+        if "id" in args and "file" not in args and "node" not in args:
+            val = args.pop("id")
+            if "/" in str(val) or "." in str(val):
+                args["file"] = val
+            else:
+                args["node"] = val
+
     if tool_name == "grep" and "query" in args and "pattern" not in args:
         args["pattern"] = args.pop("query")
+    if tool_name == "web_search" and "q" in args and "query" not in args:
+        args["query"] = args.pop("q")
 
     return args
 
@@ -892,6 +1027,7 @@ def dispatch(
     user_query: str = "",
     preloaded_docs: dict[str, dict] | None = None,
     session_path: Path | None = None,
+    hitl_enabled: bool = False,
 ) -> Any:
     """Call the named tool with its args plus injected context. Returns JSON-serialisable result."""
     if tool_name not in TOOL_REGISTRY:
@@ -923,6 +1059,7 @@ def dispatch(
         "embedder":     embedder,
         "user_query":   user_query,
         "session_path": session_path,
+        "hitl_enabled": hitl_enabled,
     }
     merged = {**args, **ctx}
 

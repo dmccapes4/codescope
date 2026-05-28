@@ -14,6 +14,18 @@ _DOC_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches source/config file paths explicitly named in a query.
+# Handles both paths with extensions and extensionless paths that contain at least one
+# directory separator (e.g. "database/entities/ClinicalNodes").
+_SOURCE_FILE_RE = re.compile(
+    r"(?:^|[\s\"'`(,])(?P<path>[\w][\w./\-]*\.(?:kt|java|xml|kts|toml|py|gradle))\b",
+    re.IGNORECASE,
+)
+# Extensionless directory/ClassName paths, e.g. "database/entities/ClinicalNodes"
+_SOURCE_PATH_RE = re.compile(
+    r"(?:^|[\s\"'`(,])(?P<path>[\w][\w\-]+(?:/[\w][\w.\-]+)+)\b",
+)
+
 
 def extract_doc_paths(query: str, project_root: Path | None = None) -> list[str]:
     """Paths mentioned in the query. Only returns files that exist (avoids READ_ME.md typos on create)."""
@@ -34,6 +46,132 @@ def extract_doc_paths(query: str, project_root: Path | None = None) -> list[str]
             seen.add(c)
             paths.append(c)
     return paths
+
+
+_SOURCE_EXTENSIONS = (".kt", ".java", ".xml", ".kts", ".toml", ".py", ".gradle")
+
+
+def _resolve_source_path(raw: str, project_root: Path, seen: set[str]) -> str | None:
+    """
+    Resolve a raw path string to a project-relative path that exists on disk.
+
+    Tries, in order:
+      1. Exact path relative to project_root
+      2. Exact path + each common extension (for extensionless inputs)
+      3. rglob by filename across the whole project tree
+    Returns a posix-relative path or None if not found.
+    """
+    raw = raw.replace("\\", "/").lstrip("./")
+    name = Path(raw).name
+
+    # 1. Exact path
+    if (project_root / raw).is_file():
+        rel = raw
+        if rel not in seen:
+            return rel
+
+    # 2. Extensionless: try appending common extensions
+    if not Path(raw).suffix:
+        for ext in _SOURCE_EXTENSIONS:
+            candidate = raw + ext
+            if (project_root / candidate).is_file():
+                if candidate not in seen:
+                    return candidate
+        # Also try just the basename + extensions (skip parent dirs)
+        for ext in _SOURCE_EXTENSIONS:
+            hits = list(project_root.rglob(name + ext))
+            if hits:
+                rel = hits[0].relative_to(project_root).as_posix()
+                if rel not in seen:
+                    return rel
+
+    # 3. rglob by full filename (with extension)
+    if Path(raw).suffix:
+        hits = list(project_root.rglob(name))
+        if hits:
+            rel = hits[0].relative_to(project_root).as_posix()
+            if rel not in seen:
+                return rel
+
+    return None
+
+
+def extract_source_file_paths(query: str, project_root: Path | None = None) -> list[str]:
+    """
+    Return source/config file paths explicitly named in the query.
+
+    Handles:
+    - Paths with code extensions: database/entities/PatientEntity.kt
+    - Extensionless directory paths: database/entities/ClinicalNodes
+    When project_root is given, validates existence and resolves the real path.
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    # Collect all raw candidates from both regexes
+    candidates: list[str] = []
+    for m in _SOURCE_FILE_RE.finditer(query):
+        candidates.append(m.group("path"))
+    for m in _SOURCE_PATH_RE.finditer(query):
+        p = m.group("path")
+        # Skip if it looks like a URL or doc path
+        if p.startswith("http") or p.endswith(".md"):
+            continue
+        # Skip if already captured by the extension regex
+        if not any(p in c or c in p for c in candidates):
+            candidates.append(p)
+
+    for raw in candidates:
+        raw = raw.replace("\\", "/").lstrip("./")
+        if project_root is None:
+            if raw not in seen:
+                seen.add(raw)
+                paths.append(raw)
+            continue
+
+        resolved = _resolve_source_path(raw, project_root, seen)
+        if resolved:
+            seen.add(resolved)
+            paths.append(resolved)
+
+    return paths
+
+
+def preflight_source_files(
+    user_query: str,
+    project_root: Path,
+    tool_results: list[dict],
+    turn_cache: dict[str, Any],
+) -> list[str]:
+    """
+    Pre-read source files explicitly named in the query (e.g. database/entities/PatientEntity.kt).
+
+    Results are appended to tool_results as read_file entries so they appear in
+    CODEBASE RESEARCH section of the answer prompt.  Returns the list of file paths read.
+    """
+    from .tools import tool_read_file
+
+    paths = extract_source_file_paths(user_query, project_root)
+    read: list[str] = []
+    for rel in paths:
+        cache_key = f"read_file:{json.dumps({'path': rel}, sort_keys=True)}"
+        if cache_key in turn_cache:
+            result = turn_cache[cache_key]
+        else:
+            try:
+                result = tool_read_file(path=rel, project_root=project_root)
+            except Exception as e:
+                result = {"error": str(e), "path": rel}
+            turn_cache[cache_key] = result
+
+        tool_results.append({
+            "name":      "read_file",
+            "args":      {"path": rel},
+            "result":    result,
+            "preflight": True,
+        })
+        read.append(rel)
+    return read
 
 
 def preflight_project_docs(
@@ -143,6 +281,15 @@ _CODEBASE_ONLY_PATTERNS = (
     "find in the project",
     "grep",
     "codebase",
+    # File-review tasks — the agent must read the file, not fetch platform docs
+    "please review",
+    "review the file",
+    "is this a correct implementation",
+    "is this correct",
+    "check this implementation",
+    "does this look correct",
+    "review this",
+    "continuing with the implementation",
     # Creating source files is codebase work, not platform-docs work
     "create patientactivity",
     "create doctoractivity",
@@ -162,13 +309,17 @@ _CODEBASE_ONLY_PATTERNS = (
 def plan_needs_android_docs(user_query: str) -> bool:
     """Whether the planner should schedule android_docs for this query.
 
-    Returns False for pure codebase/README tasks — those need grep + semantic_search,
-    not Android platform docs, and a wasted android_docs call burns ~900 tokens of
-    context budget.
+    Returns False for:
+    - Pure codebase/README tasks (grep + semantic_search suffice)
+    - File-review tasks (the named file must be read, not docs fetched)
+    - Any query that explicitly names a source file (.kt/.java/.xml etc.)
+    A wasted android_docs call burns ~700 tokens of context budget and adds latency.
     """
     q = user_query.lower()
-    # Codebase-only tasks never need android_docs
     if any(p in q for p in _CODEBASE_ONLY_PATTERNS):
+        return False
+    # If a source file is explicitly named, this is always a codebase task
+    if extract_source_file_paths(user_query):
         return False
     if query_wants_android_docs(user_query):
         return True

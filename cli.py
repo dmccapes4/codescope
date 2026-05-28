@@ -835,6 +835,7 @@ def cmd_chat(
     llm_model:     str  = _llm_opt(),
     embedder_name: str  = _embedder_opt(),
     verbose:       bool = _verbose_opt(),
+    hitl:          bool = _hitl_opt(),
 ):
     """Start an interactive chat REPL for a project."""
     from . import projects as P
@@ -855,7 +856,7 @@ def cmd_chat(
         slug=project, project_root=project_root,
         cache_dir=cache_dir, session_dir=session_dir,
         llm=llm, embedder=embedder,
-        new_session=new, verbose=verbose,
+        new_session=new, verbose=verbose, hitl_enabled=hitl,
     )
 
 
@@ -870,6 +871,7 @@ def cmd_ask(
     llm_model:     str  = _llm_opt(),
     embedder_name: str  = _embedder_opt(),
     verbose:       bool = _verbose_opt(),
+    hitl:          bool = _hitl_opt(),
 ):
     """Ask a single question and print the answer (no REPL)."""
     from . import projects as P
@@ -889,7 +891,7 @@ def cmd_ask(
     answer = ask_once(
         query=query, slug=project,
         project_root=project_root, cache_dir=cache_dir, session_dir=session_dir,
-        llm=llm, embedder=embedder, verbose=verbose,
+        llm=llm, embedder=embedder, verbose=verbose, hitl_enabled=hitl,
     )
     _print_answer(answer)
 

@@ -18,23 +18,66 @@ SESSIONS_ROOT = WORKSPACE_ROOT / "sessions"
 # Models
 # ---------------------------------------------------------------------------
 
-DEFAULT_LLM      = "qwen2.5-coder:7b-instruct-q4_K_M"
-PLANNER_LLM      = os.environ.get("CODESCOPE_PLANNER_LLM", "llama3.2:latest")
-# Separate planner model loads a second weights set each turn (slow on 6 GB VRAM).
-USE_PLANNER_LLM  = os.environ.get("CODESCOPE_USE_PLANNER_LLM", "0").lower() in ("1", "true", "yes")
-# When planner LLM is on, reuse the answer model instead of PLANNER_LLM (avoids model swap).
-PLANNER_USE_ANSWER_MODEL = os.environ.get("CODESCOPE_PLANNER_SAME_MODEL", "1").lower() not in (
-    "0", "false", "no",
+# ---------------------------------------------------------------------------
+# Hardware profiles — set CODESCOPE_PROFILE or override individual vars.
+#
+#   laptop-6gb   (default) RTX 4050 6 GB
+#     LLM    : qwen2.5-coder:7b-instruct-q4_K_M
+#     ctx    : 12 288  (all 29 layers on GPU; leaves ~350 MB headroom)
+#     planner: deterministic (USE_PLANNER_LLM=0)
+#     embed  : cpu
+#
+#   workstation-24gb        i9 / RTX 4090 24 GB
+#     LLM    : qwen2.5-coder:14b-instruct-q4_K_M  (9 GB weights)
+#     ctx    : 32 768  (14B KV ≈ 3.3 GB; llama3.2:3b planner ≈ 2 GB → ~16 GB total)
+#     planner: llama3.2:3b  (USE_PLANNER_LLM=1, PLANNER_SAME_MODEL=0)
+#     embed  : cuda
+#
+#   Override any value individually with its CODESCOPE_* env var.
+# ---------------------------------------------------------------------------
+_PROFILE = os.environ.get("CODESCOPE_PROFILE", "laptop-6gb").lower()
+
+# Answer model
+DEFAULT_LLM = os.environ.get(
+    "CODESCOPE_LLM",
+    "qwen2.5-coder:14b-instruct-q4_K_M"
+    if _PROFILE == "workstation-24gb"
+    else "qwen2.5-coder:7b-instruct-q4_K_M",
 )
+
+# llama3.2:3b is the fast planner; :latest may resolve to a larger tag on some hosts.
+_DEFAULT_PLANNER = "llama3.2:3b" if _PROFILE == "workstation-24gb" else "llama3.2:latest"
+PLANNER_LLM = os.environ.get("CODESCOPE_PLANNER_LLM", _DEFAULT_PLANNER)
+# Separate planner model loads a second weights set each turn.
+# On 6 GB this causes VRAM swap → default OFF.  On 24 GB both models stay warm → default ON.
+USE_PLANNER_LLM = os.environ.get(
+    "CODESCOPE_USE_PLANNER_LLM",
+    "1" if _PROFILE == "workstation-24gb" else "0",
+).lower() in ("1", "true", "yes")
+# When planner LLM is on, reuse the answer model instead of PLANNER_LLM (avoids model swap on 6 GB).
+PLANNER_USE_ANSWER_MODEL = os.environ.get(
+    "CODESCOPE_PLANNER_SAME_MODEL",
+    "0" if _PROFILE == "workstation-24gb" else "1",
+).lower() not in ("0", "false", "no")
 # GPU layers for the planner LLM (only relevant when USE_PLANNER_LLM=1).
-#   -1 → full GPU (default Ollama behaviour, fastest inference)
-#    0 → CPU-only inference (keeps qwen2.5 weights + KV fully in VRAM but adds ~10-80s latency)
-# On 6 GB: llama3.2:3b (2.0 GB) + qwen 7B (4.7 GB) + qwen KV @16 K (1.9 GB) ≈ 8.6 GB → swap
-# With PLANNER_NUM_GPU=0 llama runs on CPU; qwen never gets evicted.
-PLANNER_NUM_GPU  = int(os.environ.get("CODESCOPE_PLANNER_NUM_GPU", "-1"))
+#   -1 → full GPU (default; on 24 GB both models stay in VRAM simultaneously)
+#    0 → CPU-only inference (preserves qwen KV on 6 GB but adds ~10-80s latency)
+PLANNER_NUM_GPU = int(os.environ.get("CODESCOPE_PLANNER_NUM_GPU", "-1"))
 WARM_MODEL_AT_REPL = os.environ.get("CODESCOPE_WARM_MODEL", "1").lower() not in ("0", "false", "no")
 DEFAULT_EMBEDDER = "sentence-transformers/all-MiniLM-L6-v2"
+# On 6 GB: keep embedder on CPU so all qwen layers stay on GPU (~100 MB freed).
+# On 24 GB: run on CUDA for faster batch encoding during curation.
+EMBED_DEVICE = os.environ.get(
+    "CODESCOPE_EMBED_DEVICE",
+    "cuda" if _PROFILE == "workstation-24gb" else "cpu",
+)
 OLLAMA_BASE_URL  = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+
+# HTTP timeouts for Ollama /api/generate (seconds).
+# Remote tunneled 14B first load can exceed 120s; workstation profile defaults higher.
+_DEFAULT_LLM_TIMEOUT = "600" if _PROFILE == "workstation-24gb" else "120"
+LLM_TIMEOUT = float(os.environ.get("CODESCOPE_LLM_TIMEOUT", _DEFAULT_LLM_TIMEOUT))
+PLANNER_LLM_TIMEOUT = float(os.environ.get("CODESCOPE_PLANNER_TIMEOUT", str(min(LLM_TIMEOUT, 180))))
 
 # Ollama inference options for the RTX 4050 6 GB
 # num_gpu=-1  → offload all layers that fit
@@ -45,13 +88,30 @@ OLLAMA_BASE_URL  = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 #               "10m" etc. = duration string for idle timeout
 OLLAMA_NUM_GPU   = int(os.environ.get("CODESCOPE_NUM_GPU", "-1"))
 # Context window (tokens).
-#   RTX 4050 6 GB VRAM budget (approx):
-#     qwen2.5-coder 7B Q4_K_M weights : ~4.7 GB
-#     KV cache @ 16384 ctx            : ~1.9 GB  → total ~6.6 GB (fits with minor spill)
-#     KV cache @ 24576 ctx            : ~2.8 GB  → total ~7.5 GB (overflows → RAM spill → timeout)
-#   Default 16384 is the safe ceiling on 6 GB.
-#   Set CODESCOPE_NUM_CTX=24576 only if you have ≥ 8 GB VRAM.
-OLLAMA_NUM_CTX   = int(os.environ.get("CODESCOPE_NUM_CTX", "16384"))
+#
+#   laptop-6gb   (RTX 4050 6 GB, qwen 7B Q4_K_M):
+#     weights 4.46 GB + KV@12K 0.50 GB + compute 0.55 GB ≈ 5.5 GB  ✓  all layers on GPU
+#     KV@16K would push 21/29 layers to CPU → 3× slower generation
+#
+#   workstation-24gb  (RTX 4090 24 GB, qwen 14B Q4_K_M + llama3.2:3b):
+#     qwen14B 9.0 GB + KV@32K 3.3 GB + llama3b 2.0 GB + compute ≈ 16 GB  ✓
+#     All layers on GPU, comfortable headroom for embedder on CUDA.
+#
+#   Set CODESCOPE_NUM_CTX to override.
+_DEFAULT_CTX = "32768" if _PROFILE == "workstation-24gb" else "12288"
+OLLAMA_NUM_CTX = int(os.environ.get("CODESCOPE_NUM_CTX", _DEFAULT_CTX))
+
+# Answer generation limits (num_predict) — separate from context window.
+# Truncated answers are usually num_predict, not num_ctx.
+if _PROFILE == "workstation-24gb":
+    # 32K context host: allow substantially larger completions.
+    ANSWER_NUM_PREDICT       = int(os.environ.get("CODESCOPE_NUM_PREDICT", "4500"))
+    ANSWER_NUM_PREDICT_EXPLAIN = int(os.environ.get("CODESCOPE_NUM_PREDICT_EXPLAIN", "7000"))
+    ANSWER_NUM_PREDICT_WRITE   = int(os.environ.get("CODESCOPE_NUM_PREDICT_WRITE", "9000"))
+else:
+    ANSWER_NUM_PREDICT       = int(os.environ.get("CODESCOPE_NUM_PREDICT", "2000"))
+    ANSWER_NUM_PREDICT_EXPLAIN = int(os.environ.get("CODESCOPE_NUM_PREDICT_EXPLAIN", "2500"))
+    ANSWER_NUM_PREDICT_WRITE   = int(os.environ.get("CODESCOPE_NUM_PREDICT_WRITE", "3500"))
 
 # Pre-load project docs when the user names a full path in the query (e.g. docs/GAME_PLAN.md)
 PREFLIGHT_PROJECT_DOCS = os.environ.get("CODESCOPE_PREFETCH_PROJECT_DOCS", "1").lower() not in (
@@ -109,17 +169,18 @@ ANDROID_BRIEF_MAX_TOKENS = 1_000
 QUERY_TOKENS            = 200
 
 # Priority budget caps for build_answer_prompt sections (tokens).
-# Sum of all caps must not exceed PROMPT_FIELD_MAX_TOKENS (they are maxima, not guarantees).
-# At 16K (prompt budget ~9830):
-BUDGET_GRAPH        = 600    # 1. codebase graph
-BUDGET_RESEARCH     = 2_500  # 2. grep / semantic / graph_lookup / read_file
-BUDGET_GIT          = 700    # 3. git log + diff summary
-BUDGET_ANDROID      = 1_000  # 4. android_docs excerpt
-BUDGET_SESSION      = 400    # 5. query_session.json notes
-BUDGET_SESSION_LOG  = 1_200  # 6. relevant prior Q&A turns from session.jsonl
-BUDGET_DOCS         = 1_800  # 7. preloaded project docs (compressed when tight)
-BUDGET_HISTORY      = 500    # 8. last N turns (condensed)
-# Total max cap: 600+2500+700+1000+400+1200+1800+500 = 8700 → fits under 9830 ✓
+# Derived as fractions of PROMPT_FIELD_MAX_TOKENS so they auto-scale with any num_ctx.
+# At 12K (budget ~7373): total cap ≈ 6640 ✓
+# At 16K (budget ~9830): total cap ≈ 8700 ✓
+_B = PROMPT_FIELD_MAX_TOKENS
+BUDGET_GRAPH        = min(600,   _B // 16)   # ~6 %   codebase graph
+BUDGET_RESEARCH     = min(2_500, _B //  4)   # ~25%   grep / semantic / graph_lookup / read_file
+BUDGET_GIT          = min(700,   _B // 14)   # ~7 %   git log + diff summary
+BUDGET_ANDROID      = min(1_000, _B // 10)   # ~10%   android_docs excerpt
+BUDGET_SESSION      = min(400,   _B // 24)   # ~4 %   query_session.json notes
+BUDGET_SESSION_LOG  = min(1_200, _B //  8)   # ~12%   relevant prior Q&A turns from session.jsonl
+BUDGET_DOCS         = min(1_800, _B //  5)   # ~20%   preloaded project docs
+BUDGET_HISTORY      = min(500,   _B // 20)   # ~5 %   last N turns (condensed)
 
 # ---------------------------------------------------------------------------
 # Hybrid-fusion context curation floors (tokens).

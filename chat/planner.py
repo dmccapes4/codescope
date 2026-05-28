@@ -6,9 +6,9 @@ from typing import Any
 
 from pathlib import Path
 
-from ..config import PLANNER_LLM, USE_PLANNER_LLM, PLANNER_NUM_GPU
+from ..config import PLANNER_LLM, USE_PLANNER_LLM, PLANNER_NUM_GPU, PLANNER_LLM_TIMEOUT
 from ..models.llm import LLM, OllamaError
-from .preflight import plan_needs_android_docs
+from .preflight import plan_needs_android_docs, extract_source_file_paths
 from .research import query_needs_codebase_research
 
 PLANNER_SYSTEM = """\
@@ -22,7 +22,7 @@ Shape:
     ...
   ],
   "tools": [
-    {"tool": "android_docs", "args": {"topic": "room"}},
+    {"tool": "read_file", "args": {"path": "database/entities/PatientEntity.kt"}},
     ...
   ]
 }
@@ -31,11 +31,17 @@ Rules:
 - If a project doc path is already pre-loaded, mark that checklist item "done" — do NOT add docs_lookup or read_file for it.
 - Keep checklist short (3–6 items). Last item is always "Write final answer for the user".
 
+FILE REVIEW RULE (highest priority):
+  If the user names a specific source file (e.g. "review database/entities/PatientEntity.kt",
+  "check app/src/.../MainActivity.kt", "is this correct implementation?"):
+    - ALWAYS add read_file for that exact path
+    - ALWAYS add graph_lookup for that path
+    - Do NOT add android_docs — reading the file IS the task
+
 When to add android_docs:
-  YES — user asks for implementation strategy, platform API guidance, or "supporting documentation".
-  NO  — user asks to search the codebase, inspect files, create/write a README, or explore the project.
-        Codebase tasks use grep + semantic_search, NOT android_docs. Adding android_docs to a README
-        or codebase-search task wastes ~900 tokens of context with irrelevant platform docs.
+  YES — user asks for platform API guidance or "supporting documentation" with no specific file named.
+  NO  — user names a source file to review, asks to search/inspect/create/write files, or explore the codebase.
+        Adding android_docs to a file-review or codebase task wastes ~700 tokens with irrelevant content.
 
 NEVER add write_file or edit_file to the tools list.
 Writing happens in the answer phase after all research is complete, not during planning.
@@ -59,6 +65,18 @@ def _default_plan(
             "status": "done",
         })
         n += 1
+
+    # ── Named source files: always read + graph-lookup, skip android_docs ───
+    named_files = extract_source_file_paths(user_query, project_root)
+    for sf in named_files:
+        checklist.append({
+            "id": n,
+            "task": f"Read and review {sf}",
+            "status": "pending",
+        })
+        n += 1
+        tools.append({"tool": "read_file",    "args": {"path": sf}})
+        tools.append({"tool": "graph_lookup", "args": {"file": sf}})
 
     if query_needs_codebase_research(user_query):
         readme = project_root / "README.md" if project_root else None
@@ -146,7 +164,7 @@ def run_planner(
     if not use_llm:
         return default
     if planner_llm is None:
-        planner_llm = LLM(model=PLANNER_LLM, timeout=90, num_gpu=PLANNER_NUM_GPU)
+        planner_llm = LLM(model=PLANNER_LLM, timeout=PLANNER_LLM_TIMEOUT, num_gpu=PLANNER_NUM_GPU)
 
     prompt = f"""User question:
 {user_query}
@@ -169,13 +187,32 @@ Produce the plan JSON."""
         )
         data = json.loads(raw)
         if isinstance(data, dict):
-            return _merge_plan(default, data)
+            merged = _merge_plan(default, data)
+            # Enforce deterministic guards on the merged plan regardless of what the LLM added
+            _apply_plan_guards(user_query, merged)
+            return merged
     except OllamaError:
-        # Model missing (404) — deterministic default plan still runs android_docs etc.
         return default
     except (json.JSONDecodeError, TypeError):
         pass
     return default
+
+
+def _apply_plan_guards(user_query: str, plan: dict) -> None:
+    """
+    Remove tools from a (possibly LLM-generated) plan that the deterministic
+    guards would have blocked.  Mutates plan in place.
+    """
+    tools = plan.get("tools") or []
+    filtered = []
+    for t in tools:
+        name = t.get("tool", "")
+        if name == "android_docs" and not plan_needs_android_docs(user_query):
+            continue   # LLM added android_docs for a codebase/file-review task — strip it
+        if name in ("write_file", "edit_file"):
+            continue   # writing must never happen in the planning phase
+        filtered.append(t)
+    plan["tools"] = filtered
 
 
 def resolve_planner_llm() -> LLM:
@@ -184,17 +221,17 @@ def resolve_planner_llm() -> LLM:
     Respects PLANNER_NUM_GPU so the caller doesn't have to pass it explicitly.
     Set CODESCOPE_PLANNER_NUM_GPU=0 to run llama on CPU (keeps qwen VRAM warm).
     """
-    prefs = [PLANNER_LLM, "llama3.2:latest", "llama3.2:3b", "llama3.2"]
+    prefs = [PLANNER_LLM, "llama3.2:3b", "llama3.2:latest", "llama3.2"]
     try:
         probe = LLM(model=PLANNER_LLM, timeout=15)
         available = probe.list_models()
         for pref in prefs:
             for name in available:
                 if name == pref or name.split(":")[0] == pref.split(":")[0]:
-                    return LLM(model=name, timeout=90, num_gpu=PLANNER_NUM_GPU)
+                    return LLM(model=name, timeout=PLANNER_LLM_TIMEOUT, num_gpu=PLANNER_NUM_GPU)
     except Exception:
         pass
-    return LLM(model=PLANNER_LLM, timeout=90, num_gpu=PLANNER_NUM_GPU)
+    return LLM(model=PLANNER_LLM, timeout=PLANNER_LLM_TIMEOUT, num_gpu=PLANNER_NUM_GPU)
 
 
 def format_checklist(plan: dict[str, Any]) -> str:

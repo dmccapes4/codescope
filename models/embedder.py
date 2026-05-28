@@ -5,7 +5,7 @@ import numpy as np
 from functools import lru_cache
 from typing import List
 
-from ..config import DEFAULT_EMBEDDER, EMBED_BATCH_SIZE
+from ..config import DEFAULT_EMBEDDER, EMBED_BATCH_SIZE, EMBED_DEVICE
 
 
 @lru_cache(maxsize=4)
@@ -15,6 +15,16 @@ def _load_model(model_name: str, device: str):
 
 
 def _best_device() -> str:
+    """
+    Resolve the embedding device.
+
+    Respects CODESCOPE_EMBED_DEVICE (config.EMBED_DEVICE).  Default is "cpu"
+    so that the sentence-transformer does not consume VRAM that qwen needs to
+    keep all 29 layers on-GPU.  Set CODESCOPE_EMBED_DEVICE=cuda if you have
+    ≥ 8 GB VRAM and want maximum embedding throughput.
+    """
+    if EMBED_DEVICE and EMBED_DEVICE.lower() != "auto":
+        return EMBED_DEVICE.lower()
     try:
         import torch
         return "cuda" if torch.cuda.is_available() else "cpu"

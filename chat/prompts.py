@@ -16,6 +16,7 @@ Available tools:
   docs_lookup   – search or read project documentation (README.md + docs/**/*.md only)
   android_docs           – fetch ONE official Android doc page (developer.android.com)
   android_docs_validate  – verify that page matches the question; returns excerpt + url
+  web_search    – internet search (DuckDuckGo Instant API); requires HITL (--hitl)
 """
 
 RESPONSE_SCHEMA = """\
@@ -146,6 +147,12 @@ Fetches a single page from developer.android.com. Only one android_docs call per
   "topic": "<optional, same topic as android_docs>"
 }
 Fetches the page, checks relevance, returns excerpt + validated url. Required after android_docs.""",
+    "web_search": """\
+{
+  "query": "<what to search on the public web>",
+  "max_results": <integer 1..10, default 5>
+}
+Requires HITL mode (--hitl). Use for real-time or external information not present in project/docs.""",
 }
 
 ANDROID_DOCS_GUIDANCE = """\

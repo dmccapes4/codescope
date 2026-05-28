@@ -6,7 +6,14 @@ from typing import Any
 
 import httpx
 
-from ..config import OLLAMA_BASE_URL, DEFAULT_LLM, OLLAMA_NUM_GPU, OLLAMA_NUM_CTX, OLLAMA_KEEP_ALIVE
+from ..config import (
+    OLLAMA_BASE_URL,
+    DEFAULT_LLM,
+    OLLAMA_NUM_GPU,
+    OLLAMA_NUM_CTX,
+    OLLAMA_KEEP_ALIVE,
+    LLM_TIMEOUT,
+)
 
 
 class OllamaError(RuntimeError):
@@ -18,12 +25,12 @@ class LLM:
         self,
         model: str = DEFAULT_LLM,
         base_url: str = OLLAMA_BASE_URL,
-        timeout: float = 120.0,
+        timeout: float | None = None,
         num_gpu: int | None = None,
     ):
         self.model    = model
         self.base_url = base_url.rstrip("/")
-        self.timeout  = timeout
+        self.timeout  = LLM_TIMEOUT if timeout is None else timeout
         # Per-instance GPU layer override.  None → use OLLAMA_NUM_GPU global.
         # Set to 0 to run a model entirely on CPU (e.g. planner on 6 GB VRAM).
         self._num_gpu = num_gpu

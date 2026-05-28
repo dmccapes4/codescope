@@ -99,11 +99,33 @@ class GraphIndex:
         return {"node": node, "in": adj["in"], "out": adj["out"]}
 
     def lookup_file(self, file_path: str) -> list[dict]:
+        """
+        Look up all graph nodes associated with a file path.
+
+        Accepts:
+        - Exact project-relative path: "app/src/.../PatientEntity.kt"
+        - Partial suffix path:         "database/entities/PatientEntity.kt"
+        - Bare filename:               "PatientEntity.kt"
+        """
+        fp = file_path.replace("\\", "/").lstrip("./")
+
+        # 1. Exact match
+        if fp in self._by_file:
+            return [r for nid in self._by_file[fp] if (r := self.lookup_node(nid))]
+
+        # 2. Suffix match: any indexed path that ends with fp
+        matches: list[str] = [k for k in self._by_file if k.endswith(fp) or k.endswith("/" + fp)]
+        if not matches:
+            # 3. Bare filename match (e.g. "PatientEntity.kt" matches any path ending in that name)
+            name = fp.split("/")[-1]
+            matches = [k for k in self._by_file if k.split("/")[-1] == name]
+
         results = []
-        for nid in self._by_file.get(file_path, []):
-            r = self.lookup_node(nid)
-            if r:
-                results.append(r)
+        for key in matches:
+            for nid in self._by_file[key]:
+                r = self.lookup_node(nid)
+                if r:
+                    results.append(r)
         return results
 
     def list_doc_files(self) -> list[str]:

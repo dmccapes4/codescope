@@ -30,6 +30,9 @@ from ..config import (
     PLANNER_USE_ANSWER_MODEL,
     USE_PLANNER_LLM,
     WARM_MODEL_AT_REPL,
+    ANSWER_NUM_PREDICT,
+    ANSWER_NUM_PREDICT_EXPLAIN,
+    ANSWER_NUM_PREDICT_WRITE,
 )
 from ..models.llm import LLM, OllamaError
 from ..models.embedder import Embedder
@@ -38,7 +41,9 @@ from ..storage import session_state
 from .context import build_answer_prompt, build_graph_summary, get_git_log
 from .preflight import (
     extract_doc_paths,
+    extract_source_file_paths,
     preflight_project_docs,
+    preflight_source_files,
     preflight_android_docs,
     preloaded_doc_index,
 )
@@ -185,6 +190,7 @@ def _auto_validate(
     cache_dir: Path,
     session_dir: Path,
     embedder: Embedder,
+    hitl_enabled: bool,
     verbose: bool,
 ) -> None:
     val_args = {"url": url, "topic": topic or "room", "user_query": user_query}
@@ -196,6 +202,7 @@ def _auto_validate(
             "android_docs_validate", val_args,
             project_root, cache_dir, session_dir, embedder, user_query,
             session_path=session_path,
+            hitl_enabled=hitl_enabled,
         )
         turn_cache[key] = result
     if verbose:
@@ -217,6 +224,7 @@ def _execute_planned_tools(
     session_dir: Path,
     embedder: Embedder,
     user_query: str,
+    hitl_enabled: bool,
     verbose: bool,
     print_fn: Callable[[str], None],
 ) -> None:
@@ -246,6 +254,7 @@ def _execute_planned_tools(
                     project_root, cache_dir, session_dir, embedder, user_query,
                     preloaded_docs=preloaded_docs,
                     session_path=session_path,
+                    hitl_enabled=hitl_enabled,
                 )
             except ToolError as e:
                 result = {"error": str(e)}
@@ -274,6 +283,7 @@ def _execute_planned_tools(
                 cache_dir,
                 session_dir,
                 embedder,
+                hitl_enabled,
                 verbose,
             )
 
@@ -281,6 +291,16 @@ def _execute_planned_tools(
 # ---------------------------------------------------------------------------
 # Post-answer file-write hook
 # ---------------------------------------------------------------------------
+
+_EXPLAIN_PAT = _re.compile(
+    r"\b(why|how|explain|compare|difference|trade.?off|pros? and cons?|should i use)\b",
+    _re.IGNORECASE,
+)
+# Longer, implementation-heavy responses that often include code + rationale.
+_IMPLEMENT_PAT = _re.compile(
+    r"\b(implement|implementation|create|add|build|fix|error|compile|dao|repository|entity|schema|migration)\b",
+    _re.IGNORECASE,
+)
 
 _CLASS_NAME_PAT = _re.compile(
     r"(?:create|write|add|implement|build|generate)\s+(?:the\s+)?(?:file\s+)?"
@@ -410,6 +430,45 @@ def _is_write_task(user_query: str) -> bool:
     return _extract_write_intent(user_query) is not None
 
 
+def _extract_partial_content(raw: str) -> str | None:
+    """
+    Recover readable text from a truncated JSON response.
+
+    Handles the common case where the model stops generating mid-string:
+      {"action":"final_answer","content":"Here is the explanation...
+    Returns the partial content string with JSON escape sequences decoded,
+    or None if nothing useful can be extracted.
+    """
+    # Find the start of the content value
+    idx = raw.find('"content"')
+    if idx == -1:
+        return None
+    # Skip past "content": "
+    idx = raw.find('"', idx + 9)   # opening quote of value
+    if idx == -1:
+        return None
+    idx += 1  # first char of value
+
+    # Collect chars up to the end, respecting JSON escape sequences
+    chars: list[str] = []
+    i = idx
+    while i < len(raw):
+        c = raw[i]
+        if c == "\\" and i + 1 < len(raw):
+            nxt = raw[i + 1]
+            escape_map = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/"}
+            chars.append(escape_map.get(nxt, nxt))
+            i += 2
+        elif c == '"':
+            break   # clean end of JSON string
+        else:
+            chars.append(c)
+            i += 1
+
+    result = "".join(chars).strip()
+    return result if len(result) > 20 else None
+
+
 def _run_turn(
     user_query: str,
     session_path: Path,
@@ -424,6 +483,7 @@ def _run_turn(
     planner_llm: LLM | None = None,
     graph_summary: str = "",
     git_summary: str = "",
+    hitl_enabled: bool = False,
 ) -> str:
     session_store.append_user(session_path, user_query)
 
@@ -434,6 +494,7 @@ def _run_turn(
     turn_cache: dict[str, Any] = {}
 
     preflight_project_docs(user_query, project_root, tool_results, turn_cache)
+    source_files_read = preflight_source_files(user_query, project_root, tool_results, turn_cache)
     preflight_android_docs(
         user_query, cache_dir, tool_results, turn_cache,
         doc_context_fn=lambda: "",
@@ -445,6 +506,8 @@ def _run_turn(
 
     if verbose and preloaded_files:
         print_fn(f"[codescope] Pre-loaded {len(preloaded_files)} project doc(s) from query.")
+    if verbose and source_files_read:
+        print_fn(f"[codescope] Pre-read {len(source_files_read)} source file(s): {', '.join(source_files_read)}")
 
     if not graph_summary:
         graph_summary = build_graph_summary(cache_dir)
@@ -498,6 +561,7 @@ def _run_turn(
         session_dir=session_dir,
         embedder=embedder,
         user_query=user_query,
+        hitl_enabled=hitl_enabled,
         verbose=verbose,
         print_fn=print_fn,
             )
@@ -563,8 +627,13 @@ def _run_turn(
     if verbose:
         print_fn(f"\n[codescope] Answer ({llm.model})…")
 
-    # File creation tasks need more tokens for the code body
-    answer_num_predict = 3500 if _is_write_task(user_query) else 2000
+    if _is_write_task(user_query):
+        answer_num_predict = ANSWER_NUM_PREDICT_WRITE
+    elif _EXPLAIN_PAT.search(user_query) or _IMPLEMENT_PAT.search(user_query):
+        # Implementation/debug prompts usually need long prose + code snippets.
+        answer_num_predict = ANSWER_NUM_PREDICT_EXPLAIN
+    else:
+        answer_num_predict = ANSWER_NUM_PREDICT
 
     try:
         raw = llm.generate(
@@ -611,6 +680,7 @@ def _run_turn(
                 project_root, cache_dir, session_dir, embedder, user_query,
                 preloaded_docs=preloaded_docs,
                 session_path=session_path,
+                hitl_enabled=hitl_enabled,
             )
         except ToolError as e:
             result = {"error": str(e)}
@@ -630,7 +700,7 @@ def _run_turn(
                 prompt=retry_prompt + "\n\nNow respond with final_answer only.",
                 system=answer_system,
                 json_mode=True,
-                num_predict=2000,
+                num_predict=answer_num_predict,
                 temperature=0.2,
             )
             data2 = _normalize_llm_response(json.loads(raw2))
@@ -670,6 +740,38 @@ def make_session(
     return system_prompt, session_path, git_summary
 
 
+def _setup_readline(session_dir: Path) -> None:
+    """
+    Activate GNU readline for the REPL input prompt.
+
+    Provides: arrow-key cursor movement, Ctrl+A/E (line start/end),
+    Ctrl+W (delete word), Ctrl+U (clear line), Up/Down history navigation,
+    and persistent history across sessions stored in session_dir.
+
+    Falls back silently on Windows or if readline is unavailable.
+    """
+    try:
+        import readline as _rl
+    except ImportError:
+        return  # Windows without pyreadline — plain input() still works
+
+    history_file = session_dir / ".repl_history"
+
+    # Load existing history
+    try:
+        _rl.read_history_file(str(history_file))
+    except FileNotFoundError:
+        pass
+
+    _rl.set_history_length(500)
+
+    import atexit
+    atexit.register(_rl.write_history_file, str(history_file))
+
+    # Vi-style tab completion is off; keep default emacs bindings
+    _rl.parse_and_bind("tab: complete")
+
+
 def repl(
     slug: str,
     project_root: Path,
@@ -680,19 +782,27 @@ def repl(
     session_path: Path | None = None,
     verbose: bool = False,
     new_session: bool = False,
+    hitl_enabled: bool = False,
 ) -> None:
     from rich.console import Console
     from rich.markdown import Markdown
     from rich.syntax import Syntax
     from rich.panel import Panel
 
+    _setup_readline(session_dir)
+
     console = Console()
     graph_summary = build_graph_summary(cache_dir)
     planner_llm = resolve_planner_llm() if USE_PLANNER_LLM and not PLANNER_USE_ANSWER_MODEL else None
 
     if WARM_MODEL_AT_REPL:
-        console.print(f"[dim]Warming {llm.model}…[/dim]")
+        remote = "127.0.0.1" not in llm.base_url and "localhost" not in llm.base_url
+        hint = " (remote — first load may take 1–3 min)" if remote else ""
+        console.print(f"[dim]Warming answer model {llm.model}{hint}…[/dim]")
         llm.warm()
+        if planner_llm is not None:
+            console.print(f"[dim]Warming planner {planner_llm.model}…[/dim]")
+            planner_llm.warm()
 
     def _render_answer(text: str) -> None:
         from .formatting import coerce_answer_text, format_terminal_answer
@@ -703,7 +813,15 @@ def repl(
                 text = coerce_answer_text(json.loads(stripped))
                 stripped = text
             except Exception:
-                pass
+                # JSON was truncated mid-generation — try to salvage the content field
+                recovered = _extract_partial_content(stripped)
+                if recovered:
+                    stripped = (
+                        recovered
+                        + "\n\n*(response was truncated — set CODESCOPE_NUM_PREDICT_EXPLAIN=6000 "
+                        "or CODESCOPE_NUM_PREDICT and retry)*"
+                    )
+                text = stripped
         text = format_terminal_answer(stripped)
         try:
             console.print(Markdown(text))
@@ -721,16 +839,22 @@ def repl(
         project_root=project_root,
     )
 
+    from ..config import _PROFILE, OLLAMA_NUM_CTX, OLLAMA_BASE_URL, LLM_TIMEOUT
     console.print(f"\n[bold green]codescope[/bold green] — project: [cyan]{slug}[/cyan]")
-    console.print(f"Session: [dim]{session_path.name}[/dim]")
+    console.print(
+        f"Session: [dim]{session_path.name}[/dim]  Profile: [dim]{_PROFILE}[/dim]  "
+        f"ctx: [dim]{OLLAMA_NUM_CTX:,}[/dim]"
+    )
+    console.print(f"Ollama: [dim]{OLLAMA_BASE_URL}[/dim]  timeout: [dim]{int(LLM_TIMEOUT)}s[/dim]")
     if USE_PLANNER_LLM:
-        pl = llm.model if PLANNER_USE_ANSWER_MODEL else PLANNER_LLM
+        pl = llm.model if PLANNER_USE_ANSWER_MODEL else (planner_llm.model if planner_llm else PLANNER_LLM)
         console.print(f"Planner: [dim]{pl}[/dim]  Answer: [dim]{llm.model}[/dim]")
+        if PLANNER_USE_ANSWER_MODEL and _PROFILE == "workstation-24gb":
+            console.print(
+                "[dim]Tip: unset CODESCOPE_PLANNER_SAME_MODEL to use fast llama3.2:3b planner[/dim]"
+            )
     else:
-        console.print(
-            f"Planner: [dim]deterministic[/dim]  Answer: [dim]{llm.model}[/dim]  "
-            f"[dim](set CODESCOPE_USE_PLANNER_LLM=1 for LLM planner)[/dim]"
-        )
+        console.print(f"Planner: [dim]deterministic[/dim]  Answer: [dim]{llm.model}[/dim]")
     console.print("Type [bold]exit[/bold] or [bold]quit[/bold] to leave.\n")
 
     while True:
@@ -772,6 +896,7 @@ def repl(
             planner_llm=planner_llm if USE_PLANNER_LLM else None,
             graph_summary=graph_summary,
             git_summary=git_summary,
+            hitl_enabled=hitl_enabled,
         )
 
         console.print("\n[bold]codescope:[/bold]")
@@ -788,6 +913,7 @@ def ask_once(
     llm: LLM,
     embedder: Embedder,
     verbose: bool = False,
+    hitl_enabled: bool = False,
 ) -> str:
     session_path = session_store.new_path(session_dir)
     system_prompt, session_path, git_summary = make_session(
@@ -806,4 +932,5 @@ def ask_once(
         verbose=verbose,
         graph_summary=build_graph_summary(cache_dir),
         git_summary=git_summary,
+        hitl_enabled=hitl_enabled,
     )
