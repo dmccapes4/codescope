@@ -338,23 +338,47 @@ _WRITE_INTENT_PAT = _re.compile(
 )
 
 
+_FILE_REF_PAT = _re.compile(
+    r"\b([A-Za-z0-9_]+\.(?:kt|java|xml|kts|toml|gradle))\b", _re.IGNORECASE,
+)
+_ACTION_VERB_PAT = _re.compile(
+    r"\b(?:add|insert|append|include|modify|update|implement|change|put|patch|"
+    r"edit|replace|inject|wire|hook\s+up|set\s+up|introduce|refactor|rewrite|"
+    r"create|write|build|generate|extend|extract|"
+    r"fix|repair|resolve|correct|tidy|cleanup|clean\s+up|finish|complete)\b",
+    _re.IGNORECASE,
+)
+
+
 def _extract_write_intent(user_query: str) -> str | None:
     """Return a bare filename (e.g. 'PatientActivity.kt', 'README.md') if the
-    query asks to create or modify a file. Falls back to a sentinel
-    ('<write-target>') when the user clearly asks to write but does not name a
-    specific file (e.g. 'implement the Composables and write to the file')."""
+    query asks to create or modify a file.
+
+    Resolution order:
+      1. `<verb> <ClassName(Activity|Fragment|…|Composable)>` — class-name verbs.
+      2. Generic `<verb> <FILENAME.ext>` — verb immediately before a filename.
+      3. `<action verb>` anywhere + a named source file anywhere — covers
+         phrasings like 'add a Preview of PatientDashboard to PatientActivity.kt'
+         or 'inject ClinicalDatabase into ClinicalApplication.kt'.
+      4. README pattern.
+      5. Write-intent phrasing without an explicit filename — returns the
+         sentinel '<write-target>' (caller resolves via tool_results).
+    """
     m = _CLASS_NAME_PAT.search(user_query)
     if m:
         name = m.group(1)
-        if name.endswith((".kt", ".java")):
-            return name
-        return name + ".kt"
-    m = _README_PAT.search(user_query)
-    if m:
-        return "README.md"
+        return name if name.endswith((".kt", ".java")) else name + ".kt"
     m = _GENERIC_FILE_PAT.search(user_query)
     if m:
         return m.group(1)
+    # Action verb anywhere + a filename anywhere: "add a Preview … to PatientActivity.kt"
+    if _ACTION_VERB_PAT.search(user_query):
+        m = _FILE_REF_PAT.search(user_query)
+        if m:
+            return m.group(1)
+    m = _README_PAT.search(user_query)
+    if m:
+        return "README.md"
     if _WRITE_INTENT_PAT.search(user_query):
         return "<write-target>"  # sentinel — write task without an explicit filename
     return None
@@ -367,6 +391,37 @@ def _extract_code_blocks(text: str) -> list[str]:
         text, _re.DOTALL,
     )
     return sorted([b.strip() for b in blocks if len(b.strip()) > 60], key=len, reverse=True)
+
+
+# Matches the stage-2 file-section pattern:  ### <path>\n```<lang>\n<body>\n```
+# The path heading must reference a file with a recognised source/config
+# extension (excludes generic markdown ### titles like '### Files to modify').
+_FILE_SECTION_PAT = _re.compile(
+    r"^###\s+(?P<path>[A-Za-z0-9_\-./]+\.(?:kt|java|xml|kts|toml|gradle|md))\s*\n+"
+    r"```(?P<lang>[a-zA-Z]*)\n(?P<body>.*?)\n```",
+    _re.DOTALL | _re.MULTILINE,
+)
+
+
+def _parse_file_writes(answer: str) -> list[tuple[str, str]]:
+    """Pull stage-2 style `### <path>` + fenced code block sections from
+    `answer`. Returns a list of (project_relative_path, file_body) pairs.
+    Returns [] if the answer doesn't follow that shape."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for m in _FILE_SECTION_PAT.finditer(answer):
+        path = m.group("path").replace("\\", "/").lstrip("./")
+        body = m.group("body").rstrip()
+        if not body or len(body) < 30:
+            continue
+        # Sometimes the body itself starts with an inadvertent extra fence.
+        if body.startswith("```"):
+            body = body.split("\n", 1)[1] if "\n" in body else body
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append((path, body))
+    return out
 
 
 def _infer_kt_path(filename: str, tool_results: list[dict], project_root: Path) -> str | None:
@@ -396,6 +451,55 @@ def _infer_kt_path(filename: str, tool_results: list[dict], project_root: Path) 
     return None
 
 
+def _resolve_target_path(
+    filename: str,
+    tool_results: list[dict],
+    project_root: Path,
+) -> str | None:
+    """Map a bare/sentinel filename to a project-relative path.
+
+      • Real path (already has '/' and exists)  → use as-is.
+      • README                                  → README.md at root.
+      • Bare .kt/.java filename                 → search preflight reads /
+                                                  graph hits, else _infer_kt_path.
+      • '<write-target>' sentinel               → the most recently preflighted
+                                                  source file (the file the
+                                                  question is about).
+    """
+    if filename == "README.md":
+        return "README.md"
+
+    if filename == "<write-target>":
+        # Prefer the last preflight-read source file — that's the file the
+        # user almost certainly wants edited.
+        for tr in reversed(tool_results):
+            if tr.get("name") == "read_file" and tr.get("preflight"):
+                p = (tr.get("result") or {}).get("path") or (tr.get("args") or {}).get("path")
+                if p:
+                    return str(p).replace("\\", "/").lstrip("./")
+        return None
+
+    cleaned = filename.replace("\\", "/").lstrip("./")
+    if "/" in cleaned and (project_root / cleaned).is_file():
+        return cleaned
+
+    # Try matching against any path we've already read this turn.
+    base = Path(cleaned).name
+    for tr in tool_results:
+        if tr.get("name") != "read_file":
+            continue
+        p = (tr.get("result") or {}).get("path") or (tr.get("args") or {}).get("path")
+        if p and Path(str(p)).name == base:
+            return str(p).replace("\\", "/").lstrip("./")
+
+    if cleaned.endswith((".kt", ".java")):
+        inferred = _infer_kt_path(base, tool_results, project_root)
+        if inferred:
+            return inferred
+
+    return cleaned if "/" in cleaned else None
+
+
 def _maybe_write_file(
     user_query: str,
     answer: str,
@@ -405,14 +509,57 @@ def _maybe_write_file(
     verbose: bool,
     print_fn,
 ) -> str:
-    """After final_answer, detect file-creation intent and write the code block."""
+    """After final_answer, detect file-write intent and write the code block(s).
+
+    Two paths:
+      1. Stage-2 multi-file shape: `### <path>` + fenced code block, repeated.
+         All matching sections are written.
+      2. Single-file legacy shape: longest fenced code block goes to the file
+         inferred from the query (`_extract_write_intent` + `_resolve_target_path`).
+    """
     from .tools import tool_write_file, ToolError as _TE
 
-    filename = _extract_write_intent(user_query)
-    if not filename:
+    if not _extract_write_intent(user_query):
         return answer
 
-    # Determine content: prefer explicit code blocks; for README accept raw markdown
+    written: list[tuple[str, int, str]] = []  # (path, bytes, action)
+
+    # ── Path 1: stage-2 multi-file sections ──────────────────────────────────
+    sections = _parse_file_writes(answer)
+    if sections:
+        for raw_path, body in sections:
+            target = _resolve_target_path(raw_path, tool_results, project_root)
+            if not target:
+                if verbose:
+                    print_fn(f"[codescope] auto-write: cannot resolve path for {raw_path}")
+                continue
+            try:
+                result = tool_write_file(
+                    path=target,
+                    content=body,
+                    overwrite=True,
+                    project_root=project_root,
+                    session_path=session_path,
+                )
+                if result.get("status") == "ok":
+                    written.append((target, result.get("bytes", 0), result.get("action", "written")))
+                    print_fn(
+                        f"[codescope] auto-wrote {target} "
+                        f"({result.get('bytes', 0)} bytes)"
+                    )
+            except _TE as e:
+                print_fn(f"[codescope] auto-write failed for {target}: {e}")
+
+        if written:
+            footer = "\n\n---\n" + "\n".join(
+                f"**File {a}:** `{p}` ({b} bytes)" for p, b, a in written
+            )
+            return answer + footer
+        # If sections found but nothing written successfully, fall through to
+        # the legacy single-file path as a last resort.
+
+    # ── Path 2: legacy single-file ───────────────────────────────────────────
+    filename = _extract_write_intent(user_query) or ""
     blocks = _extract_code_blocks(answer)
     if not blocks and filename == "README.md" and answer.strip().startswith("#"):
         blocks = [answer.strip()]
@@ -422,22 +569,15 @@ def _maybe_write_file(
         return answer
 
     content = blocks[0]  # longest block
-
-    # Resolve path
-    if filename == "README.md":
-        path = "README.md"
-    elif filename.endswith(".kt") or filename.endswith(".java"):
-        path = _infer_kt_path(filename, tool_results, project_root)
-        if not path:
-            if verbose:
-                print_fn(f"[codescope] auto-write: cannot infer path for {filename}")
-            return answer
-    else:
-        path = filename
+    target = _resolve_target_path(filename, tool_results, project_root)
+    if not target:
+        if verbose:
+            print_fn(f"[codescope] auto-write: cannot infer path for {filename}")
+        return answer
 
     try:
         result = tool_write_file(
-            path=path,
+            path=target,
             content=content,
             overwrite=True,
             project_root=project_root,
@@ -445,9 +585,10 @@ def _maybe_write_file(
         )
         if result.get("status") == "ok":
             action = result.get("action", "written")
-            if verbose:
-                print_fn(f"[codescope] auto-wrote {path} ({result.get('bytes', 0)} bytes)")
-            return answer + f"\n\n---\n**File {action}:** `{path}` ({result.get('bytes', 0)} bytes)"
+            print_fn(
+                f"[codescope] auto-wrote {target} ({result.get('bytes', 0)} bytes)"
+            )
+            return answer + f"\n\n---\n**File {action}:** `{target}` ({result.get('bytes', 0)} bytes)"
     except _TE as e:
         if verbose:
             print_fn(f"[codescope] auto-write failed: {e}")
@@ -528,12 +669,52 @@ def _looks_truncated(answer: str) -> bool:
     return False
 
 
-_CONTINUATION_INSTRUCTION = (
+_CONTINUATION_INSTRUCTION_CLOSED = (
     "The previous response was truncated. Continue EXACTLY where it left off; "
-    "do not repeat or summarize any earlier text. Close any open code block "
-    "with ``` and end the answer cleanly. Return plain markdown (no JSON "
-    "wrapper this time)."
+    "do not repeat or summarize any earlier text. End the answer cleanly. "
+    "Return plain markdown (no JSON wrapper this time)."
 )
+_CONTINUATION_INSTRUCTION_OPEN_FENCE = (
+    "The previous response was truncated WHILE INSIDE AN OPEN CODE BLOCK. "
+    "Your continuation MUST:\n"
+    "  • Resume writing CODE on the next line — do NOT emit ``` at the start. "
+    "You are still inside the open fence.\n"
+    "  • When the code body is finished, close the fence with a line "
+    "containing exactly ``` and nothing else.\n"
+    "  • Then add at most one short closing sentence in plain markdown.\n"
+    "Do not restate or summarize anything from the partial answer."
+)
+
+
+def _detect_open_fence_lang(partial: str) -> str | None:
+    """If the partial ends inside an open ``` fence, return the language tag
+    that opened it (e.g. 'kotlin'), else None."""
+    fences = list(_re.finditer(r"```([a-zA-Z]*)", partial))
+    if not fences:
+        return None
+    # Odd number of fences => last one is unclosed.
+    if len(fences) % 2 == 0:
+        return None
+    last = fences[-1]
+    return (last.group(1) or "").strip() or ""
+
+
+def _strip_leading_reopened_fence(cont: str, lang: str | None) -> str:
+    """Stage-2 continuation requests qwen NOT to re-open a fence, but it
+    sometimes does it anyway (`\\n```kotlin\\n`). Strip such a leading reopen so
+    we don't end up with `<code>\\n```kotlin\\n<more code>` glued together."""
+    if not cont:
+        return cont
+    stripped = cont.lstrip()
+    # Possible reopen patterns: ```\n / ```kotlin\n / ```kt\n / language\n
+    m = _re.match(r"^```([a-zA-Z]*)\s*\n", stripped)
+    if not m:
+        return cont
+    fence_lang = (m.group(1) or "").strip()
+    # Only strip the reopen if the language matches the open fence (or both empty).
+    if lang is None or fence_lang == "" or fence_lang.lower() == (lang or "").lower():
+        return stripped[m.end():]
+    return cont
 
 
 def _attempt_continuation(
@@ -544,22 +725,43 @@ def _attempt_continuation(
 ) -> str:
     """Ask the answer LLM to continue a truncated response. Returns the
     concatenated, hopefully-complete answer. On failure returns the partial
-    plus a visible truncation note."""
+    plus a visible truncation note.
+    """
+    open_fence_lang = _detect_open_fence_lang(partial_answer)
+    inside_fence = open_fence_lang is not None
+
     print_fn(
-        f"[codescope] Answer truncated — continuing with {llm.model} "
-        f"(num_predict={num_predict})…"
+        f"[codescope] Answer truncated"
+        + (" mid-code-block" if inside_fence else "")
+        + f" — continuing with {llm.model} (num_predict={num_predict})…"
     )
-    primer = (
+
+    primer_intro = (
         "Here is the partial answer so far. Continue it from the exact point "
-        "it stopped — do not restate anything that's already there.\n\n"
-        "=== PARTIAL ANSWER (continue from here) ===\n"
+        "it stopped — do not restate anything that's already there."
+    )
+    if inside_fence:
+        primer_intro += (
+            f"\nThe partial ends INSIDE an open ```{open_fence_lang} code "
+            "block. Resume by writing the next line of code (no opening "
+            "fence). Close the fence with ``` when the code body is done."
+        )
+
+    primer = (
+        primer_intro
+        + "\n\n=== PARTIAL ANSWER (continue from here) ===\n"
         + partial_answer.rstrip()
         + "\n=== CONTINUE BELOW ==="
+    )
+    system = (
+        _CONTINUATION_INSTRUCTION_OPEN_FENCE
+        if inside_fence
+        else _CONTINUATION_INSTRUCTION_CLOSED
     )
     try:
         cont = llm.generate(
             prompt=primer,
-            system=_CONTINUATION_INSTRUCTION,
+            system=system,
             json_mode=False,
             num_predict=num_predict,
             temperature=0.15,
@@ -570,15 +772,19 @@ def _attempt_continuation(
             "\n\n*(response was truncated and continuation failed — try "
             "CODESCOPE_NUM_PREDICT_WRITE=12000 and retry)*"
         )
-    cont = (cont or "").strip()
-    if not cont:
+    cont = (cont or "")
+    if not cont.strip():
         return partial_answer + (
             "\n\n*(response was truncated; continuation returned empty)*"
         )
-    # Ensure any unclosed fence still gets closed.
-    glued = partial_answer.rstrip() + "\n" + cont
+
+    if inside_fence:
+        cont = _strip_leading_reopened_fence(cont, open_fence_lang)
+
+    glued = partial_answer.rstrip() + ("\n" if not partial_answer.endswith("\n") else "") + cont
+    # Final safety net: ensure every fence is balanced.
     if glued.count("```") % 2 == 1:
-        glued += "\n```"
+        glued = glued.rstrip() + "\n```"
     return glued
 
 
@@ -803,11 +1009,11 @@ def _run_turn(
     # ── Two-stage write flow ─────────────────────────────────────────────────
     # For write tasks on a capable model, first ask the same LLM for a compact
     # markdown implementation plan, pretty-print it, then re-call it with the
-    # plan injected so it can spend its whole num_predict budget on actual code
-    # instead of rehashing the review.
+    # plan injected and a strict "emit full file bodies under ### <path> headings"
+    # system suffix so stage 2 actually emits code (not a plan recap).
     plan_md: str | None = None
     if is_write and TWO_STAGE_WRITE:
-        from .write_flow import run_plan_stage, inject_plan_into_prompt
+        from .write_flow import run_plan_stage, inject_plan_into_prompt, build_stage2_system
 
         plan_md = run_plan_stage(
             llm=llm,
@@ -817,6 +1023,7 @@ def _run_turn(
         )
         if plan_md:
             prompt = inject_plan_into_prompt(prompt, plan_md)
+            answer_system = build_stage2_system(answer_system)
             print_fn(
                 f"[codescope] Stage 2/2: implementing per plan with {llm.model} "
                 f"(num_predict={answer_num_predict})…"
@@ -857,18 +1064,13 @@ def _run_turn(
     data = _normalize_llm_response(data)
     try:
         resp = AgentResponse.model_validate(data)
+        validated = True
     except ValidationError:
-        from .formatting import coerce_answer_text
-        try:
-            answer = coerce_answer_text(data)
-        except Exception:
-            answer = raw
-        if not answer.strip():
-            answer = raw
-        session_store.append_assistant(session_path, answer)
-        return answer
+        resp = None
+        validated = False
 
-    if resp.action == "tool_call":
+    thought = ""
+    if validated and resp is not None and resp.action == "tool_call":
         tool_name = resp.tool or ""
         args = normalize_tool_args(tool_name, dict(resp.args or {}))
         if verbose:
@@ -906,17 +1108,34 @@ def _run_turn(
             answer = data2.get("content") or raw2
         except Exception:
             answer = str(result)
-    else:
+        thought = resp.thought or ""
+    elif validated and resp is not None:
         answer = _answer_text(resp.content)
+        thought = resp.thought or ""
+    else:
+        # Validation failed — usually because the JSON was truncated mid-string.
+        # Salvage the partial `content` first, then let the truncation
+        # continuation recover the rest.
+        from .formatting import coerce_answer_text
+        salvaged = _extract_partial_content(raw)
+        if salvaged:
+            answer = salvaged
+        else:
+            try:
+                answer = coerce_answer_text(data)
+            except Exception:
+                answer = raw
+        if not (answer or "").strip():
+            answer = raw
 
-    # Truncation recovery: when num_predict ran out mid-code-block or
-    # mid-sentence, call the LLM once more in plain-markdown mode to finish.
-    # Only triggers on write/explain tasks where the budget is in play.
+    # Truncation recovery: applies to EVERY path (final_answer, tool_call retry,
+    # AND the ValidationError salvage path). When num_predict ran out
+    # mid-code-block or mid-sentence, call the LLM once more in plain-markdown
+    # mode to finish.
     if mode_label in ("write", "explain") and _looks_truncated(answer):
-        # Use a fraction of the original budget for the continuation. Plenty
-        # for a closing code fence + a few sentences, doesn't double total
-        # runtime.
-        cont_budget = max(1500, min(answer_num_predict // 2, 4000))
+        # Use a generous fraction of the original budget for the continuation.
+        # Capped at 6000 tokens for the 64K context host.
+        cont_budget = max(2000, min(answer_num_predict // 2, 6000))
         answer = _attempt_continuation(llm, answer, cont_budget, print_fn)
 
     # Post-answer hook: if the task asked to create a file and the model produced
@@ -926,7 +1145,7 @@ def _run_turn(
         user_query, answer, tool_results, project_root, session_path, verbose, print_fn
     )
 
-    session_store.append_assistant(session_path, answer, thought=resp.thought or "")
+    session_store.append_assistant(session_path, answer, thought=thought)
     return answer
 
 

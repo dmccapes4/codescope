@@ -108,24 +108,31 @@ OLLAMA_NUM_GPU   = int(os.environ.get("CODESCOPE_NUM_GPU", "-1"))
 #     KV@16K would push 21/29 layers to CPU → 3× slower generation
 #
 #   workstation-24gb  (RTX 4090 24 GB, qwen 14B Q4_K_M + llama3.2:3b):
-#     qwen14B 9.0 GB + KV@32K 3.3 GB + llama3b 2.0 GB + compute ≈ 16 GB  ✓
-#     All layers on GPU, comfortable headroom for embedder on CUDA.
+#     qwen14B base ≈ 9.0 GB + KV@64K ≈ 6.5 GB + llama3b ≈ 2.0 GB + compute ≈ 1.5 GB
+#       ≈ 19 GB  ✓  all layers on GPU, ~4-5 GB headroom for embedder + spikes.
+#     We need the 64 K window because a full Kotlin Activity rewrite (PRE-READ
+#     source files + research + a 200-line code block) does not fit at 32 K with
+#     ANSWER_NUM_PREDICT_WRITE ≥ 12000.
 #
-#   Set CODESCOPE_NUM_CTX to override.
-_DEFAULT_CTX = "32768" if _PROFILE == "workstation-24gb" else "12288"
+#   Override:  CODESCOPE_NUM_CTX=32768 to revert (saves ~3.3 GB VRAM).
+_DEFAULT_CTX = "65536" if _PROFILE == "workstation-24gb" else "12288"
 OLLAMA_NUM_CTX = int(os.environ.get("CODESCOPE_NUM_CTX", _DEFAULT_CTX))
 
 # Answer generation limits (num_predict) — separate from context window.
 # Truncated answers are usually num_predict, not num_ctx.
+#
+# A full mid-size Kotlin file (~250 lines incl. imports) is ~3000 tokens; a
+# full-file rewrite plus a short intro/outro needs ~4000 tokens. Multi-file
+# stage-2 implementations regularly hit 8-10 K tokens — bump WRITE to 14 K so
+# the model has real headroom on a 64 K context host.
 if _PROFILE == "workstation-24gb":
-    # 32K context host: allow substantially larger completions.
-    ANSWER_NUM_PREDICT       = int(os.environ.get("CODESCOPE_NUM_PREDICT", "4500"))
-    ANSWER_NUM_PREDICT_EXPLAIN = int(os.environ.get("CODESCOPE_NUM_PREDICT_EXPLAIN", "7000"))
-    ANSWER_NUM_PREDICT_WRITE   = int(os.environ.get("CODESCOPE_NUM_PREDICT_WRITE", "9000"))
+    ANSWER_NUM_PREDICT         = int(os.environ.get("CODESCOPE_NUM_PREDICT",         "6000"))
+    ANSWER_NUM_PREDICT_EXPLAIN = int(os.environ.get("CODESCOPE_NUM_PREDICT_EXPLAIN", "10000"))
+    ANSWER_NUM_PREDICT_WRITE   = int(os.environ.get("CODESCOPE_NUM_PREDICT_WRITE",   "14000"))
 else:
-    ANSWER_NUM_PREDICT       = int(os.environ.get("CODESCOPE_NUM_PREDICT", "2000"))
+    ANSWER_NUM_PREDICT         = int(os.environ.get("CODESCOPE_NUM_PREDICT",         "2000"))
     ANSWER_NUM_PREDICT_EXPLAIN = int(os.environ.get("CODESCOPE_NUM_PREDICT_EXPLAIN", "2500"))
-    ANSWER_NUM_PREDICT_WRITE   = int(os.environ.get("CODESCOPE_NUM_PREDICT_WRITE", "3500"))
+    ANSWER_NUM_PREDICT_WRITE   = int(os.environ.get("CODESCOPE_NUM_PREDICT_WRITE",   "3500"))
 
 # Pre-load project docs when the user names a full path in the query (e.g. docs/GAME_PLAN.md)
 PREFLIGHT_PROJECT_DOCS = os.environ.get("CODESCOPE_PREFETCH_PROJECT_DOCS", "1").lower() not in (
@@ -184,18 +191,19 @@ QUERY_TOKENS            = 200
 
 # Priority budget caps for build_answer_prompt sections (tokens).
 # Derived as fractions of PROMPT_FIELD_MAX_TOKENS so they auto-scale with any num_ctx.
-# At 12K (budget ~7373): total cap ≈ 6640 ✓
-# At 16K (budget ~9830): total cap ≈ 8700 ✓
+# At 12K (prompt budget ~7373): total cap ≈  6640 ✓
+# At 32K (prompt budget ~19660): total cap ≈ 17400 ✓
+# At 64K (prompt budget ~39321): total cap ≈ 34800 ✓
 _B = PROMPT_FIELD_MAX_TOKENS
-BUDGET_PREREAD      = min(8_000, _B //  3)   # ~33%   user-named source files (read in preflight)
-BUDGET_GRAPH        = min(600,   _B // 16)   # ~6 %   codebase graph
-BUDGET_RESEARCH     = min(2_500, _B //  4)   # ~25%   grep / semantic / graph_lookup / read_file (ad-hoc)
-BUDGET_GIT          = min(700,   _B // 14)   # ~7 %   git log + diff summary
-BUDGET_ANDROID      = min(1_000, _B // 10)   # ~10%   android_docs excerpt
-BUDGET_SESSION      = min(400,   _B // 24)   # ~4 %   query_session.json notes
-BUDGET_SESSION_LOG  = min(1_200, _B //  8)   # ~12%   relevant prior Q&A turns from session.jsonl
-BUDGET_DOCS         = min(1_800, _B //  5)   # ~20%   preloaded project docs
-BUDGET_HISTORY      = min(500,   _B // 20)   # ~5 %   last N turns (condensed)
+BUDGET_PREREAD      = min(16_000, _B //  3)   # ~33%   user-named source files (read in preflight)
+BUDGET_GRAPH        = min(1_500,  _B // 16)   # ~6 %   codebase graph
+BUDGET_RESEARCH     = min(6_000,  _B //  4)   # ~25%   grep / semantic / graph_lookup / read_file (ad-hoc)
+BUDGET_GIT          = min(1_500,  _B // 14)   # ~7 %   git log + diff summary
+BUDGET_ANDROID      = min(2_500,  _B // 10)   # ~10%   android_docs excerpt
+BUDGET_SESSION      = min(1_000,  _B // 24)   # ~4 %   query_session.json notes
+BUDGET_SESSION_LOG  = min(3_000,  _B //  8)   # ~12%   relevant prior Q&A turns from session.jsonl
+BUDGET_DOCS         = min(4_500,  _B //  5)   # ~20%   preloaded project docs
+BUDGET_HISTORY      = min(1_200,  _B // 20)   # ~5 %   last N turns (condensed)
 
 # Per-file truncation inside the PRE-READ section. With 8 K BUDGET_PREREAD and
 # typical preflight pulling 1-2 files, we can comfortably emit a full small/mid
