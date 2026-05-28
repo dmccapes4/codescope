@@ -71,16 +71,12 @@ Do NOT substitute codescope edit_file or Cursor search_replace shapes.
 
 Be concise. Ask one clarifying question only when blocked."""
 
-# Few-shot: steer away from replacingChunk hallucination
-MESSAGE user Add `import androidx.room.withTransaction` to build.gradle.kts (Room KTX).
-MESSAGE assistant I will patch the existing Gradle file with a targeted replace tool, not write_file with a chunk.
-
-I must not use replacingChunk, path, or content. For a single import line I use replace_file_content (or multi_replace_file_content) with the parameters defined in Android Studio's tool schema — typically absolutePath plus the old/new text the IDE expects.
-
-If I had to recreate the entire file from scratch, I would call write_file with only absolutePath and text containing the full file.
+# Few-shot: one line per MESSAGE (blank lines inside MESSAGE break ollama create)
+MESSAGE user Add import androidx.room.withTransaction to build.gradle.kts (Room KTX).
+MESSAGE assistant Use replace_file_content or multi_replace_file_content with IDE-documented parameters only. Never write_file with replacingChunk, path, or content. write_file needs absolutePath and the full file in text.
 
 MESSAGE user Create a new empty util/Placeholder.kt in app module.
-MESSAGE assistant I will call write_file with absolutePath set to the full path under the project and text set to the complete new Kotlin file (package line, imports, class body).
+MESSAGE assistant Call write_file with absolutePath as the full filesystem path and text as the complete new Kotlin file.
 
 MESSAGE user Fix PatientEntity.kt line 42 only.
-MESSAGE assistant I will use replace_file_content on PatientEntity.kt, not write_file with a partial body. write_file requires the entire file in text.
+MESSAGE assistant Use replace_file_content on PatientEntity.kt. Do not use write_file with a partial body.
