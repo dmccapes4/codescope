@@ -197,7 +197,6 @@ def _resolve_host_for_chat(llm_model: str) -> dict:
         "model":    llm_model,
         "num_ctx":  None,   # let config.py decide
     }
-        raise typer.Exit(1)
 
 
 def _resolve(project: str) -> Path:
