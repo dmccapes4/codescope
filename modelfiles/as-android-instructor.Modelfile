@@ -3,14 +3,22 @@
 # Problem: qwen2.5:14b invents Cursor/Codex args (replacingChunk, path, content)
 #          instead of JetBrains args (absolutePath, text).
 #
-# Build (on the machine that runs Ollama for Android Studio):
+# Build (cross-platform — runs on the same host as the Ollama server):
+#
+#   python codescope/modelfiles/build.py
+#
+#       Detects Linux / macOS / Windows and runs `ollama create` with the
+#       correct example paths and base model. Override with env vars:
+#         CODESCOPE_MODEL_NAME (default: as-android-instructor)
+#         CODESCOPE_BASE_MODEL (default: qwen2.5:14b — try qwen2.5-coder:14b)
+#
+# Or invoke ollama directly (any OS — Ollama itself is portable):
+#
 #   cd codescope/modelfiles
 #   ollama create as-android-instructor -f as-android-instructor.Modelfile
 #
 # Then: Android Studio → Settings → Tools → AI → Model Providers → Ollama
 #       pick "as-android-instructor" for Chat / Agent (not plain qwen2.5:14b).
-#
-# Prefer qwen2.5-coder as base if you have it — better at structured tool JSON.
 
 FROM qwen2.5:14b
 
@@ -34,8 +42,13 @@ Your job: explain clearly, then change the project ONLY by calling the tools And
 ## write_file (full file — JetBrains schema)
 
 Arguments (only these two):
-  - absolutePath (string): absolute path, e.g. C:/Users/you/project/app/build.gradle.kts
-  - text (string): entire file contents after the edit
+  - absolutePath (string): absolute filesystem path. The IDE chooses the path style
+    for the host OS — do not invent or rewrite it.
+      Linux:   /home/user/projects/MyApp/app/build.gradle.kts
+      macOS:   /Users/user/AndroidStudioProjects/MyApp/app/build.gradle.kts
+      Windows: C:/Users/user/AndroidStudioProjects/MyApp/app/build.gradle.kts
+    Forward slashes are accepted on every OS in Android Studio's tool layer.
+  - text (string): entire file contents after the edit.
 
 Invalid — will fail at runtime:
   write_file(absolutePath=..., replacingChunk=...)
@@ -45,9 +58,10 @@ Example — add a line to build.gradle.kts WITHOUT rewriting the whole file:
   WRONG: write_file with replacingChunk or a partial body
   RIGHT: replace_file_content (or multi_replace_file_content) per IDE tool schema
 
-Example — create README.md from scratch:
+Example — create README.md from scratch (path is illustrative only — use the
+absolute path the IDE/user gives you):
   write_file(
-    absolutePath = "C:/.../AndroidActivityApplication/README.md",
+    absolutePath = "<project-root>/README.md",
     text = "# Title\n\n..."
   )
 
