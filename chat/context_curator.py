@@ -19,8 +19,12 @@ from typing import Any
 
 import numpy as np
 
-# Logical display order for sections in the assembled prompt
+# Logical display order for sections in the assembled prompt.
+# `preread` (user-named source files loaded in preflight) is FIRST — these are
+# the exact files the question is about, so the answer LLM must see them before
+# graph/research/etc.
 _SOURCE_ORDER = [
+    "preread",
     "graph",
     "research",
     "git",
@@ -32,6 +36,7 @@ _SOURCE_ORDER = [
 ]
 
 _SECTION_HEADERS: dict[str, str] = {
+    "preread":     "=== PRE-READ SOURCE FILES (user named these — full bodies) ===",
     "graph":       "=== CODEBASE GRAPH ===",
     "research":    "=== CODEBASE RESEARCH (grep / semantic / graph / read_file) ===",
     "git":         "=== GIT CONTEXT ===",
@@ -80,7 +85,7 @@ def _chunks_for_source(source: str, text: str) -> list[ContextChunk]:
     if not text.strip():
         return []
 
-    if source in ("research", "session_log"):
+    if source in ("research", "session_log", "preread"):
         parts = _split_on_headers(text)
         if len(parts) > 1:
             return [

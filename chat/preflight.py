@@ -1,6 +1,7 @@
 """Pre-load project docs mentioned in the user query before the first LLM hop."""
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from pathlib import Path
@@ -8,6 +9,93 @@ from typing import Any
 
 from ..config import PREFLIGHT_ANDROID_DOCS, PREFLIGHT_PROJECT_DOCS
 from .tools import tool_docs_lookup
+
+# Cache of every source file under each project root (basename → list of relative paths)
+# so we can do cheap difflib matches on typos like "ClinicalApplicaton.kt".
+_PROJECT_FILE_INDEX: dict[str, list[str]] = {}
+_TYPO_SIMILARITY_CUTOFF = 0.82  # 0.0–1.0; below this we don't auto-correct
+# A correction must be measurably better than picking a random file of the same
+# extension; we also require the closest match to lead the runner-up by this
+# much to avoid silently grabbing the wrong sibling.
+_TYPO_MARGIN = 0.05
+
+
+def _project_file_index(project_root: Path) -> list[str]:
+    """Return all source/config files under project_root as project-relative posix paths.
+    Cached per project_root for the life of the process."""
+    key = str(project_root.resolve())
+    cached = _PROJECT_FILE_INDEX.get(key)
+    if cached is not None:
+        return cached
+    files: list[str] = []
+    for ext in _SOURCE_EXTENSIONS:
+        for p in project_root.rglob(f"*{ext}"):
+            try:
+                rel = p.relative_to(project_root).as_posix()
+            except ValueError:
+                continue
+            # Skip build artifacts / IDE caches — they pollute close-match results.
+            if rel.startswith((".gradle/", ".idea/", "build/", ".codescope-cache/")):
+                continue
+            if "/build/" in rel:
+                continue
+            files.append(rel)
+    _PROJECT_FILE_INDEX[key] = files
+    return files
+
+
+def _token_sort_ratio(a: str, b: str) -> float:
+    """Like fuzzy token-sort: tokenise on [_\\-\\s.], sort, then compare. Handles
+    typos that ALSO reorder tokens, e.g. STARTEGY_PATIENT_ACTIVITY vs
+    PATIENT_ACTIVITY_STRATEGY."""
+    def _tokens(s: str) -> str:
+        return " ".join(sorted(t for t in re.split(r"[_\-\s.]+", s.lower()) if t))
+    return difflib.SequenceMatcher(None, _tokens(a), _tokens(b)).ratio()
+
+
+def _best_filename_score(query_name: str, candidate_name: str) -> float:
+    """Return max(SequenceMatcher, token-sort) — the best of both worlds for
+    typos vs reorderings."""
+    a = Path(query_name.lower()).stem
+    b = Path(candidate_name.lower()).stem
+    s1 = difflib.SequenceMatcher(None, a, b).ratio()
+    s2 = _token_sort_ratio(a, b)
+    return max(s1, s2)
+
+
+def _closest_filename_match(name: str, project_root: Path) -> str | None:
+    """Find the project-relative path whose basename is closest to `name` (typo-tolerant).
+    Returns None if no match clears the similarity cutoff."""
+    if not name:
+        return None
+    files = _project_file_index(project_root)
+    if not files:
+        return None
+    name_lower = name.lower()
+    name_ext = Path(name_lower).suffix
+
+    # Only consider candidates with matching extension if one was provided.
+    pool = [f for f in files if (not name_ext or Path(f).suffix.lower() == name_ext)]
+    if not pool:
+        pool = files
+
+    # Score by basename similarity using max(SequenceMatcher, token-sort) so we
+    # catch both letter-flips AND reordered tokens (e.g. STARTEGY_PATIENT_ACTIVITY
+    # vs PATIENT_ACTIVITY_STRATEGY).
+    scored: list[tuple[float, str]] = []
+    for rel in pool:
+        s = _best_filename_score(name, Path(rel).name)
+        scored.append((s, rel))
+    scored.sort(reverse=True)
+    if not scored:
+        return None
+    best_score, best_rel = scored[0]
+    if best_score < _TYPO_SIMILARITY_CUTOFF:
+        return None
+    if len(scored) > 1 and (best_score - scored[1][0]) < _TYPO_MARGIN:
+        # Two files are equally close — refuse to guess.
+        return None
+    return best_rel
 
 _DOC_PATH_RE = re.compile(
     r"(?:^|[\s\"'`(])(?P<path>(?:docs/)?[\w][\w./_-]*\.md)\b",
@@ -28,7 +116,10 @@ _SOURCE_PATH_RE = re.compile(
 
 
 def extract_doc_paths(query: str, project_root: Path | None = None) -> list[str]:
-    """Paths mentioned in the query. Only returns files that exist (avoids READ_ME.md typos on create)."""
+    """Paths mentioned in the query. Returns files that exist; for typos like
+    'docs/STARTEGY_PATIENT.md' (missing 'R') we fall through to a difflib match
+    against the actual files under docs/, gated by _TYPO_SIMILARITY_CUTOFF.
+    """
     paths: list[str] = []
     seen: set[str] = set()
     for m in _DOC_PATH_RE.finditer(query):
@@ -37,15 +128,59 @@ def extract_doc_paths(query: str, project_root: Path | None = None) -> list[str]
             candidates = [p, f"docs/{p}"]
         else:
             candidates = [p]
+        resolved = None
         for c in candidates:
             if c in seen:
-                continue
-            if project_root is not None:
-                if not (project_root / c).is_file():
-                    continue
-            seen.add(c)
-            paths.append(c)
+                resolved = c
+                break
+            if project_root is None:
+                resolved = c
+                break
+            if (project_root / c).is_file():
+                resolved = c
+                break
+
+        if resolved is None and project_root is not None:
+            # Typo tolerance: try difflib against project_root/docs/*.md.
+            resolved = _closest_doc_match(p, project_root)
+
+        if resolved and resolved not in seen:
+            seen.add(resolved)
+            paths.append(resolved)
+
     return paths
+
+
+def _closest_doc_match(name: str, project_root: Path) -> str | None:
+    """Find the closest docs/*.md file to `name` (typo-tolerant + reorder-tolerant).
+    Returns a project-relative posix path or None if no candidate clears the cutoff."""
+    if not name:
+        return None
+    name = name.replace("\\", "/")
+    bare = Path(name).name
+    docs_dir = project_root / "docs"
+    if not docs_dir.is_dir():
+        candidates = list(project_root.rglob("*.md"))
+    else:
+        candidates = list(docs_dir.rglob("*.md"))
+    if not candidates:
+        return None
+    scored: list[tuple[float, Path]] = []
+    for p in candidates:
+        s = _best_filename_score(bare, p.name)
+        scored.append((s, p))
+    scored.sort(reverse=True)
+    if not scored:
+        return None
+    best_score, best_path = scored[0]
+    if best_score < _TYPO_SIMILARITY_CUTOFF:
+        return None
+    if len(scored) > 1 and (best_score - scored[1][0]) < _TYPO_MARGIN:
+        return None
+    try:
+        return best_path.relative_to(project_root).as_posix()
+    except ValueError:
+        return None
 
 
 _SOURCE_EXTENSIONS = (".kt", ".java", ".xml", ".kts", ".toml", ".py", ".gradle")
@@ -59,6 +194,7 @@ def _resolve_source_path(raw: str, project_root: Path, seen: set[str]) -> str | 
       1. Exact path relative to project_root
       2. Exact path + each common extension (for extensionless inputs)
       3. rglob by filename across the whole project tree
+      4. difflib close-match against project file index (typo tolerance)
     Returns a posix-relative path or None if not found.
     """
     raw = raw.replace("\\", "/").lstrip("./")
@@ -93,6 +229,11 @@ def _resolve_source_path(raw: str, project_root: Path, seen: set[str]) -> str | 
             if rel not in seen:
                 return rel
 
+    # 4. Typo tolerance — try difflib close-match against the file index.
+    fuzzy = _closest_filename_match(name, project_root)
+    if fuzzy and fuzzy not in seen:
+        return fuzzy
+
     return None
 
 
@@ -103,9 +244,19 @@ def extract_source_file_paths(query: str, project_root: Path | None = None) -> l
     Handles:
     - Paths with code extensions: database/entities/PatientEntity.kt
     - Extensionless directory paths: database/entities/ClinicalNodes
-    When project_root is given, validates existence and resolves the real path.
+    When project_root is given, validates existence and resolves the real path
+    (including typo-tolerant difflib close-matches).
     """
-    paths: list[str] = []
+    return [rel for rel, _raw in extract_source_file_resolutions(query, project_root)]
+
+
+def extract_source_file_resolutions(
+    query: str,
+    project_root: Path | None = None,
+) -> list[tuple[str, str]]:
+    """Like extract_source_file_paths but returns (resolved_rel, original_raw) pairs
+    so callers can detect typo corrections (resolved basename != raw basename)."""
+    out: list[tuple[str, str]] = []
     seen: set[str] = set()
 
     # Collect all raw candidates from both regexes
@@ -126,15 +277,15 @@ def extract_source_file_paths(query: str, project_root: Path | None = None) -> l
         if project_root is None:
             if raw not in seen:
                 seen.add(raw)
-                paths.append(raw)
+                out.append((raw, raw))
             continue
 
         resolved = _resolve_source_path(raw, project_root, seen)
         if resolved:
             seen.add(resolved)
-            paths.append(resolved)
+            out.append((resolved, raw))
 
-    return paths
+    return out
 
 
 def preflight_source_files(
@@ -146,14 +297,17 @@ def preflight_source_files(
     """
     Pre-read source files explicitly named in the query (e.g. database/entities/PatientEntity.kt).
 
-    Results are appended to tool_results as read_file entries so they appear in
-    CODEBASE RESEARCH section of the answer prompt.  Returns the list of file paths read.
+    Results are appended to tool_results as read_file entries with preflight=True so
+    they render in the PRE-READ SOURCE FILES section of the answer prompt.
+    Typo-corrected resolutions get a `_note` on the result so the LLM (and the
+    user, via stdout) can see the correction.
+    Returns the list of (display) file paths read.
     """
     from .tools import tool_read_file
 
-    paths = extract_source_file_paths(user_query, project_root)
+    resolutions = extract_source_file_resolutions(user_query, project_root)
     read: list[str] = []
-    for rel in paths:
+    for rel, raw in resolutions:
         cache_key = f"read_file:{json.dumps({'path': rel}, sort_keys=True)}"
         if cache_key in turn_cache:
             result = turn_cache[cache_key]
@@ -164,13 +318,24 @@ def preflight_source_files(
                 result = {"error": str(e), "path": rel}
             turn_cache[cache_key] = result
 
+        # Detect typo correction: resolved basename differs from what the user wrote.
+        raw_base = Path(raw.replace("\\", "/")).name.lower()
+        rel_base = Path(rel).name.lower()
+        if raw_base and raw_base != rel_base and isinstance(result, dict) and "error" not in result:
+            note = f"resolved typo: '{raw}' → '{rel}' (closest match)"
+            result.setdefault("_note", note)
+
         tool_results.append({
             "name":      "read_file",
-            "args":      {"path": rel},
+            "args":      {"path": rel, "original_query_path": raw},
             "result":    result,
             "preflight": True,
         })
-        read.append(rel)
+        # Display label shows correction in-line so the visible banner is honest.
+        if raw_base and raw_base != rel_base:
+            read.append(f"{rel} (was: {raw})")
+        else:
+            read.append(rel)
     return read
 
 

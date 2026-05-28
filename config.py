@@ -64,6 +64,20 @@ PLANNER_USE_ANSWER_MODEL = os.environ.get(
 #    0 → CPU-only inference (preserves qwen KV on 6 GB but adds ~10-80s latency)
 PLANNER_NUM_GPU = int(os.environ.get("CODESCOPE_PLANNER_NUM_GPU", "-1"))
 WARM_MODEL_AT_REPL = os.environ.get("CODESCOPE_WARM_MODEL", "1").lower() not in ("0", "false", "no")
+
+# Two-stage write flow: plan (markdown, ~1500 tokens) → implement (JSON, full
+# ANSWER_NUM_PREDICT_WRITE). On by default for the workstation profile because
+# qwen2.5-coder:14b consistently truncates mid-code-block on a single pass when
+# asked to "review N files AND implement Composables AND write to disk". The
+# laptop fallback profile (smaller model, tighter context) disables it so we
+# don't spend two LLM round-trips on a 3 B model that can usually finish in one.
+_TWO_STAGE_DEFAULT = "1" if os.environ.get("CODESCOPE_PROFILE", "").lower() == "workstation-24gb" else "0"
+TWO_STAGE_WRITE = os.environ.get(
+    "CODESCOPE_TWO_STAGE_WRITE", _TWO_STAGE_DEFAULT
+).lower() not in ("0", "false", "no")
+TWO_STAGE_PLAN_NUM_PREDICT = int(
+    os.environ.get("CODESCOPE_TWO_STAGE_PLAN_NUM_PREDICT", "1500")
+)
 DEFAULT_EMBEDDER = "sentence-transformers/all-MiniLM-L6-v2"
 # On 6 GB: keep embedder on CPU so all qwen layers stay on GPU (~100 MB freed).
 # On 24 GB: run on CUDA for faster batch encoding during curation.
@@ -173,8 +187,9 @@ QUERY_TOKENS            = 200
 # At 12K (budget ~7373): total cap ≈ 6640 ✓
 # At 16K (budget ~9830): total cap ≈ 8700 ✓
 _B = PROMPT_FIELD_MAX_TOKENS
+BUDGET_PREREAD      = min(8_000, _B //  3)   # ~33%   user-named source files (read in preflight)
 BUDGET_GRAPH        = min(600,   _B // 16)   # ~6 %   codebase graph
-BUDGET_RESEARCH     = min(2_500, _B //  4)   # ~25%   grep / semantic / graph_lookup / read_file
+BUDGET_RESEARCH     = min(2_500, _B //  4)   # ~25%   grep / semantic / graph_lookup / read_file (ad-hoc)
 BUDGET_GIT          = min(700,   _B // 14)   # ~7 %   git log + diff summary
 BUDGET_ANDROID      = min(1_000, _B // 10)   # ~10%   android_docs excerpt
 BUDGET_SESSION      = min(400,   _B // 24)   # ~4 %   query_session.json notes
@@ -182,11 +197,18 @@ BUDGET_SESSION_LOG  = min(1_200, _B //  8)   # ~12%   relevant prior Q&A turns f
 BUDGET_DOCS         = min(1_800, _B //  5)   # ~20%   preloaded project docs
 BUDGET_HISTORY      = min(500,   _B // 20)   # ~5 %   last N turns (condensed)
 
+# Per-file truncation inside the PRE-READ section. With 8 K BUDGET_PREREAD and
+# typical preflight pulling 1-2 files, we can comfortably emit a full small/mid
+# Kotlin file (≤ 6 K chars ≈ 1500 tokens) verbatim. Hard ceiling keeps any single
+# enormous file from monopolizing the section.
+PREREAD_FILE_MAX_CHARS = 6_000
+
 # ---------------------------------------------------------------------------
 # Hybrid-fusion context curation floors (tokens).
 # These guarantee a minimum token contribution from each source, even if the
 # overall budget is tight. Only sources with a non-zero floor are pinned.
 # ---------------------------------------------------------------------------
+FLOOR_PREREAD       = 2_000 # user-named files are the WHOLE point of the question — pin a lot
 FLOOR_GRAPH         = 250   # always show some graph topology
 FLOOR_RESEARCH      = 300   # always include top code-evidence chunks if research ran
 FLOOR_GIT           = 0     # git context is only shown when explicitly triggered

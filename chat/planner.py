@@ -133,19 +133,67 @@ def _default_plan(
     return {"checklist": checklist, "tools": tools}
 
 
+def _checklist_key(task: str) -> str:
+    """Normalised checklist task key used to detect duplicates between the
+    deterministic plan and whatever llama3.2 added. Lower-case, strip filler
+    verbs/articles so 'Read X', 'Read and review X', 'Review X' collapse."""
+    import re as _re
+    s = (task or "").lower().strip()
+    s = _re.sub(r"\s+", " ", s)
+    # Strip leading filler so 'Read', 'Read and review', 'Review', 'Check', etc.
+    # all hash to the same prefix.
+    s = _re.sub(
+        r"^(?:please\s+)?(?:then\s+)?"
+        r"(?:read(?:\s+and\s+review)?|review|check|inspect|open|load|look\s+at)\s+",
+        "",
+        s,
+    )
+    s = _re.sub(r"\s*\(.*?\)\s*$", "", s)  # drop trailing parentheticals
+    return s
+
+
 def _merge_plan(default: dict, llm_plan: dict) -> dict[str, Any]:
-    """Keep deterministic preloaded 'done' items; merge tools (default + LLM)."""
-    out = {"checklist": list(default.get("checklist") or []), "tools": []}
+    """Keep deterministic preloaded 'done' items; merge tools (default + LLM).
+
+    Checklist items are de-duped using a normalised key (so 'Read X' and 'Read
+    and review X' collapse), and IDs are renumbered sequentially at the end so
+    we never show two `[ ] 1.` lines.
+    """
+    out: dict[str, Any] = {"checklist": [], "tools": []}
+
+    seen_keys: set[str] = set()
+    for item in default.get("checklist") or []:
+        if not isinstance(item, dict):
+            continue
+        key = _checklist_key(item.get("task", ""))
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out["checklist"].append(dict(item))
+
+    for c in llm_plan.get("checklist") or []:
+        if not isinstance(c, dict) or not c.get("task"):
+            continue
+        key = _checklist_key(c.get("task", ""))
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out["checklist"].append(dict(c))
+
+    # Move "write final answer" items to the end so they always read last.
+    final_items = [c for c in out["checklist"] if "final answer" in c.get("task", "").lower()]
+    non_final = [c for c in out["checklist"] if c not in final_items]
+    out["checklist"] = non_final + final_items
+
+    # Renumber IDs after the merge so the rendered list is sequential.
+    for i, c in enumerate(out["checklist"], 1):
+        c["id"] = i
+
     merged: dict[str, dict] = {}
     for t in (default.get("tools") or []) + (llm_plan.get("tools") or []):
         if isinstance(t, dict) and t.get("tool"):
             merged[t["tool"]] = {"tool": t["tool"], "args": t.get("args") or {}}
     out["tools"] = list(merged.values())
-    # Append any LLM checklist items not duplicating preloaded paths
-    existing = {c.get("task", "") for c in out["checklist"]}
-    for c in llm_plan.get("checklist") or []:
-        if isinstance(c, dict) and c.get("task") and c["task"] not in existing:
-            out["checklist"].append(c)
     return out
 
 

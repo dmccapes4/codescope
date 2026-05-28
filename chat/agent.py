@@ -2,8 +2,15 @@
 from __future__ import annotations
 
 import json
+import os as _os
 from pathlib import Path
 from typing import Any, Callable
+
+# Silence sentence-transformers' "Loading weights: …" tqdm bar and the HF Hub
+# unauthenticated-request warning. We surface our own clean banner instead.
+_os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+_os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+_os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 from rich.syntax import Syntax
 from rich.panel import Panel
@@ -33,6 +40,8 @@ from ..config import (
     ANSWER_NUM_PREDICT,
     ANSWER_NUM_PREDICT_EXPLAIN,
     ANSWER_NUM_PREDICT_WRITE,
+    TWO_STAGE_WRITE,
+    TWO_STAGE_PLAN_NUM_PREDICT,
 )
 from ..models.llm import LLM, OllamaError
 from ..models.embedder import Embedder
@@ -303,32 +312,51 @@ _IMPLEMENT_PAT = _re.compile(
 )
 
 _CLASS_NAME_PAT = _re.compile(
-    r"(?:create|write|add|implement|build|generate)\s+(?:the\s+)?(?:file\s+)?"
+    r"(?:create|write|add|implement|build|generate|modify|update|patch)\s+(?:the\s+)?(?:file\s+)?"
     r"((?:Patient|Doctor|Graph|Main|Ants|Timer|News|\w+)"
-    r"(?:Activity|Fragment|ViewModel|Repository|Dao|Database|Entity))",
+    r"(?:Activity|Fragment|ViewModel|Repository|Dao|Database|Entity|Composable))",
     _re.IGNORECASE,
 )
 _README_PAT = _re.compile(r"(?:create|write|add|generate)\s+(?:a\s+|the\s+)?"
                            r"(README(?:\.md)?)", _re.IGNORECASE)
 _GENERIC_FILE_PAT = _re.compile(
-    r"(?:create|write|add)\s+(?:the\s+file\s+)?([A-Za-z0-9_\-]+\.[a-z]{2,4})",
+    r"(?:create|write|add|modify|update|patch)\s+(?:the\s+file\s+)?"
+    r"([A-Za-z0-9_\-]+\.[a-z]{2,4})",
+    _re.IGNORECASE,
+)
+# Catches the "please write to the file" / "save to disk" / "apply the change"
+# phrasing that does not name a file by extension but clearly asks for a write.
+_WRITE_INTENT_PAT = _re.compile(
+    r"\b("
+    r"write\s+(?:to|it\s+to|them\s+to|out)\s+(?:the\s+)?(?:file|disk|files|the\s+kt)"
+    r"|save\s+(?:to|it\s+to|the\s+changes\s+to|the\s+file)"
+    r"|apply\s+the\s+change(?:s)?"
+    r"|(?:update|modify|patch|edit)\s+the\s+(?:file|composable|composables|activity|viewmodel|entity|dao|repository|class|fragment|gradle|module)"
+    r"|implement\s+the\s+(?:composable|composables|activity|viewmodel|repository|dao|entity|ui)"
+    r")\b",
     _re.IGNORECASE,
 )
 
 
 def _extract_write_intent(user_query: str) -> str | None:
     """Return a bare filename (e.g. 'PatientActivity.kt', 'README.md') if the
-    query asks to create a file, else None."""
+    query asks to create or modify a file. Falls back to a sentinel
+    ('<write-target>') when the user clearly asks to write but does not name a
+    specific file (e.g. 'implement the Composables and write to the file')."""
     m = _CLASS_NAME_PAT.search(user_query)
     if m:
         name = m.group(1)
-        return name if name.endswith((".kt", ".java")) else name + ".kt"
+        if name.endswith((".kt", ".java")):
+            return name
+        return name + ".kt"
     m = _README_PAT.search(user_query)
     if m:
         return "README.md"
     m = _GENERIC_FILE_PAT.search(user_query)
     if m:
         return m.group(1)
+    if _WRITE_INTENT_PAT.search(user_query):
+        return "<write-target>"  # sentinel — write task without an explicit filename
     return None
 
 
@@ -469,6 +497,123 @@ def _extract_partial_content(raw: str) -> str | None:
     return result if len(result) > 20 else None
 
 
+# --------------------------------------------------------------------------
+# Truncation recovery
+# --------------------------------------------------------------------------
+
+def _looks_truncated(answer: str) -> bool:
+    """Heuristically detect whether an answer was cut off by num_predict.
+
+    Triggers when:
+      • Odd number of ``` fences (an open code block at end).
+      • Ends without a sentence-ending character AND without a closing fence.
+      • Last 200 chars contain an obviously-incomplete identifier (open `(` /
+        `{` count exceeds close count by 3+).
+    """
+    if not answer or not answer.strip():
+        return False
+    text = answer.rstrip()
+    fence_count = text.count("```")
+    if fence_count % 2 == 1:
+        return True
+    last_tail = text[-200:]
+    open_paren = last_tail.count("(") - last_tail.count(")")
+    open_brace = last_tail.count("{") - last_tail.count("}")
+    if open_paren >= 3 or open_brace >= 3:
+        return True
+    if not text.endswith(("```", "}", ")", "]", ".", "!", "?", "—", ":")):
+        # Trailing word-character with no terminator: likely cut mid-sentence.
+        if text[-1].isalnum() or text[-1] in "-_,/":
+            return True
+    return False
+
+
+_CONTINUATION_INSTRUCTION = (
+    "The previous response was truncated. Continue EXACTLY where it left off; "
+    "do not repeat or summarize any earlier text. Close any open code block "
+    "with ``` and end the answer cleanly. Return plain markdown (no JSON "
+    "wrapper this time)."
+)
+
+
+def _attempt_continuation(
+    llm: LLM,
+    partial_answer: str,
+    num_predict: int,
+    print_fn: Callable[[str], None],
+) -> str:
+    """Ask the answer LLM to continue a truncated response. Returns the
+    concatenated, hopefully-complete answer. On failure returns the partial
+    plus a visible truncation note."""
+    print_fn(
+        f"[codescope] Answer truncated — continuing with {llm.model} "
+        f"(num_predict={num_predict})…"
+    )
+    primer = (
+        "Here is the partial answer so far. Continue it from the exact point "
+        "it stopped — do not restate anything that's already there.\n\n"
+        "=== PARTIAL ANSWER (continue from here) ===\n"
+        + partial_answer.rstrip()
+        + "\n=== CONTINUE BELOW ==="
+    )
+    try:
+        cont = llm.generate(
+            prompt=primer,
+            system=_CONTINUATION_INSTRUCTION,
+            json_mode=False,
+            num_predict=num_predict,
+            temperature=0.15,
+        )
+    except OllamaError as e:
+        print_fn(f"[codescope] Continuation failed: {e}.")
+        return partial_answer + (
+            "\n\n*(response was truncated and continuation failed — try "
+            "CODESCOPE_NUM_PREDICT_WRITE=12000 and retry)*"
+        )
+    cont = (cont or "").strip()
+    if not cont:
+        return partial_answer + (
+            "\n\n*(response was truncated; continuation returned empty)*"
+        )
+    # Ensure any unclosed fence still gets closed.
+    glued = partial_answer.rstrip() + "\n" + cont
+    if glued.count("```") % 2 == 1:
+        glued += "\n```"
+    return glued
+
+
+# Keywords used to map completed phases to checklist items. The heuristic is
+# coarse but useful: when "research" ran, any checklist item mentioning grep /
+# semantic / graph / search gets a check mark. The user still sees raw phase
+# banners above so this is just a tidy recap.
+_PHASE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "preread":  ("read", "review", "inspect", "open", "load"),
+    "plan":     ("plan", "draft plan", "outline"),
+    "research": ("grep", "semantic", "graph", "search", "find", "locate", "explore"),
+    "session":  ("prior", "session", "previous turn", "earlier"),
+    "git":      ("git", "diff", "commit", "log"),
+    "answer":   ("answer", "respond", "synthes", "write", "explain", "summari"),
+}
+
+
+def _mark_checklist_done(plan: dict, phases_done: set[str]) -> dict:
+    """Return a shallow copy of `plan` with checklist statuses updated to 'done'
+    for any item whose task text contains a keyword from a completed phase."""
+    import copy
+    new_plan = copy.deepcopy(plan)
+    for item in new_plan.get("checklist") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") == "done":
+            continue
+        task_lower = str(item.get("task", "")).lower()
+        for phase in phases_done:
+            if any(kw in task_lower for kw in _PHASE_KEYWORDS.get(phase, ())):
+                item["status"] = "done"
+                break
+    return new_plan
+
+
 def _run_turn(
     user_query: str,
     session_path: Path,
@@ -492,9 +637,12 @@ def _run_turn(
 
     tool_results: list[dict] = []
     turn_cache: dict[str, Any] = {}
+    phases_done: set[str] = set()  # tracks phases that ran for the final checklist update
 
     preflight_project_docs(user_query, project_root, tool_results, turn_cache)
     source_files_read = preflight_source_files(user_query, project_root, tool_results, turn_cache)
+    if source_files_read:
+        phases_done.add("preread")
     preflight_android_docs(
         user_query, cache_dir, tool_results, turn_cache,
         doc_context_fn=lambda: "",
@@ -504,10 +652,13 @@ def _run_turn(
         user_query, project_root
     )
 
-    if verbose and preloaded_files:
+    if preloaded_files:
         print_fn(f"[codescope] Pre-loaded {len(preloaded_files)} project doc(s) from query.")
-    if verbose and source_files_read:
-        print_fn(f"[codescope] Pre-read {len(source_files_read)} source file(s): {', '.join(source_files_read)}")
+    if source_files_read:
+        print_fn(
+            f"[codescope] Pre-read {len(source_files_read)} source file(s): "
+            + ", ".join(source_files_read)
+        )
 
     if not graph_summary:
         graph_summary = build_graph_summary(cache_dir)
@@ -525,8 +676,7 @@ def _run_turn(
     planner_label = (
         effective_planner.model if effective_planner else "deterministic (no LLM)"
     )
-    if verbose:
-        print_fn(f"[codescope] Planner ({planner_label})…")
+    print_fn(f"[codescope] Planning ({planner_label})…")
 
     plan = run_planner(
         user_query,
@@ -547,8 +697,10 @@ def _run_turn(
         metadata={"tools": [t.get("tool") for t in plan.get("tools") or [] if isinstance(t, dict)]},
     )
 
-    if verbose:
-        print_fn(format_checklist(plan))
+    # Always print the checklist so the user can see what the agent committed to.
+    checklist_text = format_checklist(plan)
+    if checklist_text.strip():
+        print_fn(checklist_text)
 
     _execute_planned_tools(
         plan,
@@ -566,9 +718,11 @@ def _run_turn(
         print_fn=print_fn,
             )
 
+    phases_done.add("plan")
+
     if query_needs_codebase_research(user_query):
-        if verbose:
-            print_fn("[codescope] Codebase research…")
+        phases_done.add("research")
+        print_fn("[codescope] Codebase research (grep + semantic + graph)…")
         run_codebase_research(
             user_query,
             session_path,
@@ -586,8 +740,8 @@ def _run_turn(
 
     # Always pull session history when query references a prior turn
     if query_needs_session_search(user_query):
-        if verbose:
-            print_fn("[codescope] Session search (prior turns)…")
+        phases_done.add("session")
+        print_fn("[codescope] Searching prior session turns…")
         run_session_search(
             user_query,
             session_path,
@@ -600,8 +754,8 @@ def _run_turn(
 
     # Pull git diff + log when the query asks about recent changes, OR always as context
     if query_needs_git_context(user_query):
-        if verbose:
-            print_fn("[codescope] Git context…")
+        phases_done.add("git")
+        print_fn("[codescope] Pulling git context…")
         run_git_context(
             user_query,
             session_path,
@@ -624,16 +778,61 @@ def _run_turn(
         embedder=embedder,
     )
 
-    if verbose:
-        print_fn(f"\n[codescope] Answer ({llm.model})…")
-
-    if _is_write_task(user_query):
+    is_write = _is_write_task(user_query)
+    if is_write:
         answer_num_predict = ANSWER_NUM_PREDICT_WRITE
+        mode_label = "write"
     elif _EXPLAIN_PAT.search(user_query) or _IMPLEMENT_PAT.search(user_query):
         # Implementation/debug prompts usually need long prose + code snippets.
         answer_num_predict = ANSWER_NUM_PREDICT_EXPLAIN
+        mode_label = "explain"
     else:
         answer_num_predict = ANSWER_NUM_PREDICT
+        mode_label = "answer"
+
+    # Updated checklist: mark the items whose phases ran. The answer phase itself
+    # is marked optimistically so the user sees a fully-checked list when the
+    # LLM finishes — they'll see the actual answer immediately after.
+    phases_done.add("answer")
+    updated_plan = _mark_checklist_done(plan, phases_done)
+    updated_checklist = format_checklist(updated_plan)
+    if updated_checklist.strip() and updated_checklist != checklist_text:
+        print_fn("[codescope] Checklist progress:")
+        print_fn(updated_checklist)
+
+    # ── Two-stage write flow ─────────────────────────────────────────────────
+    # For write tasks on a capable model, first ask the same LLM for a compact
+    # markdown implementation plan, pretty-print it, then re-call it with the
+    # plan injected so it can spend its whole num_predict budget on actual code
+    # instead of rehashing the review.
+    plan_md: str | None = None
+    if is_write and TWO_STAGE_WRITE:
+        from .write_flow import run_plan_stage, inject_plan_into_prompt
+
+        plan_md = run_plan_stage(
+            llm=llm,
+            base_prompt=prompt,
+            print_fn=print_fn,
+            plan_num_predict=TWO_STAGE_PLAN_NUM_PREDICT,
+        )
+        if plan_md:
+            prompt = inject_plan_into_prompt(prompt, plan_md)
+            print_fn(
+                f"[codescope] Stage 2/2: implementing per plan with {llm.model} "
+                f"(num_predict={answer_num_predict})…"
+            )
+        else:
+            # Plan stage failed/empty — fall back to a normal single-stage call.
+            print_fn(
+                f"[codescope] Generating {mode_label} with {llm.model} "
+                f"(num_predict={answer_num_predict})…"
+            )
+    else:
+        # Always announce the answer model — this is the slow phase the user is waiting on.
+        print_fn(
+            f"[codescope] Generating {mode_label} with {llm.model} "
+            f"(num_predict={answer_num_predict})…"
+        )
 
     try:
         raw = llm.generate(
@@ -709,6 +908,16 @@ def _run_turn(
             answer = str(result)
     else:
         answer = _answer_text(resp.content)
+
+    # Truncation recovery: when num_predict ran out mid-code-block or
+    # mid-sentence, call the LLM once more in plain-markdown mode to finish.
+    # Only triggers on write/explain tasks where the budget is in play.
+    if mode_label in ("write", "explain") and _looks_truncated(answer):
+        # Use a fraction of the original budget for the continuation. Plenty
+        # for a closing code fence + a few sentences, doesn't double total
+        # runtime.
+        cont_budget = max(1500, min(answer_num_predict // 2, 4000))
+        answer = _attempt_continuation(llm, answer, cont_budget, print_fn)
 
     # Post-answer hook: if the task asked to create a file and the model produced
     # a code block in its answer (rather than calling write_file via tool_call),
@@ -794,6 +1003,15 @@ def repl(
     console = Console()
     graph_summary = build_graph_summary(cache_dir)
     planner_llm = resolve_planner_llm() if USE_PLANNER_LLM and not PLANNER_USE_ANSWER_MODEL else None
+
+    if not embedder.is_loaded():
+        console.print(
+            f"[dim]Loading embedding weights ({embedder.model_name} on {embedder.device})…[/dim]"
+        )
+        try:
+            embedder.warm()
+        except Exception as e:
+            console.print(f"[red]Embedder failed to load: {e}[/red]")
 
     if WARM_MODEL_AT_REPL:
         remote = "127.0.0.1" not in llm.base_url and "localhost" not in llm.base_url

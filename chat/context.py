@@ -16,6 +16,7 @@ from ..config import (
     PROMPT_FIELD_MAX_TOKENS,
     PREFLIGHT_DOC_MAX_TOKENS,
     ANDROID_BRIEF_MAX_TOKENS,
+    BUDGET_PREREAD,
     BUDGET_GRAPH,
     BUDGET_RESEARCH,
     BUDGET_GIT,
@@ -24,9 +25,11 @@ from ..config import (
     BUDGET_SESSION_LOG,
     BUDGET_DOCS,
     BUDGET_HISTORY,
+    FLOOR_PREREAD,
     FLOOR_GRAPH,
     FLOOR_RESEARCH,
     FLOOR_SESSION,
+    PREREAD_FILE_MAX_CHARS,
 )
 from ..storage.graph import GraphIndex
 
@@ -161,13 +164,53 @@ def _format_session_log(tool_results: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+def _format_preread(tool_results: list[dict]) -> str:
+    """
+    Render preflight-pre-read source files as ### blocks, FULL bodies (truncated
+    only at PREREAD_FILE_MAX_CHARS per file). These are the files the user
+    explicitly named in their question, so they get their own top-priority
+    section and a generous per-file char cap — not the 600-char clip used for
+    ad-hoc read_file results in CODEBASE RESEARCH.
+    """
+    parts: list[str] = []
+    for tr in tool_results:
+        if tr.get("name") != "read_file":
+            continue
+        if not tr.get("preflight"):
+            continue
+        result = tr.get("result")
+        if not isinstance(result, dict) or result.get("error"):
+            continue
+        content = (result.get("content") or "").strip()
+        if not content:
+            continue
+        path = result.get("path") or (tr.get("args") or {}).get("path", "?")
+        start = result.get("start", "")
+        end = result.get("end", "")
+        body = content[:PREREAD_FILE_MAX_CHARS]
+        if len(content) > PREREAD_FILE_MAX_CHARS:
+            body += "\n… [truncated — file longer than PREREAD_FILE_MAX_CHARS]"
+        note = result.get("_note")
+        header = f"### {path} (lines {start}–{end})"
+        if note:
+            header += f"\n_note: {note}_"
+        parts.append(header + "\n```\n" + body + "\n```")
+    return "\n\n".join(parts)
+
+
 def _format_research(tool_results: list[dict]) -> str:
-    """Format all retrieved code evidence: grep, semantic_search, graph_lookup, read_file."""
+    """Format all retrieved code evidence: grep, semantic_search, graph_lookup, read_file.
+
+    NOTE: preflight read_file results are excluded here — they live in the
+    PRE-READ SOURCE FILES section (see _format_preread).
+    """
     parts: list[str] = []
     for tr in tool_results:
         name = tr.get("name")
         if name not in ("grep", "semantic_search", "graph_lookup", "read_file"):
             continue
+        if name == "read_file" and tr.get("preflight"):
+            continue  # rendered above in PRE-READ SOURCE FILES
         result = tr.get("result")
         args = tr.get("args") or {}
         if isinstance(result, dict) and result.get("error"):
@@ -237,7 +280,7 @@ def _format_research(tool_results: list[dict]) -> str:
                 start = result.get("start", "")
                 end   = result.get("end", "")
                 header = f"### read_file({p} lines {start}–{end})"
-                parts.append(header + "\n" + content[:600] + ("…" if len(content) > 600 else ""))
+                parts.append(header + "\n" + content[:1500] + ("…" if len(content) > 1500 else ""))
     return "\n\n".join(parts)
 
 
@@ -329,6 +372,7 @@ def build_answer_prompt(
     context_budget = PROMPT_FIELD_MAX_TOKENS - count_tokens(fixed)
 
     # ── Pre-render each source section ───────────────────────────────────────
+    preread_raw     = _format_preread(tool_results)
     research_raw    = _format_research(tool_results)
     git_raw_tools   = _format_git(tool_results)
     git_combined    = "\n\n".join(filter(None, [git_summary.strip(), git_raw_tools]))
@@ -342,6 +386,7 @@ def build_answer_prompt(
         from .context_curator import curate_context, render_context
 
         section_map = {
+            "preread":     preread_raw,
             "graph":       graph_summary.strip(),
             "research":    research_raw,
             "git":         git_combined,
@@ -352,6 +397,7 @@ def build_answer_prompt(
             "history":     hist_raw,
         }
         floors = {
+            "preread":  FLOOR_PREREAD,
             "graph":    FLOOR_GRAPH,
             "research": FLOOR_RESEARCH,
             "session":  FLOOR_SESSION,
@@ -370,6 +416,16 @@ def build_answer_prompt(
     # ── Legacy waterfall path (no embedder) ──────────────────────────────────
     remaining = context_budget
     sections: list[str] = []
+
+    if preread_raw and remaining > 0:
+        text, used = _fit(
+            "=== PRE-READ SOURCE FILES (user named these — full bodies) ===\n"
+            + preread_raw,
+            min(BUDGET_PREREAD, remaining),
+        )
+        if text:
+            sections.append(text)
+            remaining -= used
 
     if graph_summary.strip() and remaining > 0:
         text, used = _fit(

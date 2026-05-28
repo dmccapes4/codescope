@@ -42,6 +42,14 @@ class Embedder:
         if self._model is None:
             self._model = _load_model(self.model_name, self.device)
 
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    def warm(self) -> None:
+        """Force the embedding weights into memory now (so the cost is visible
+        at REPL startup rather than mid-turn). Safe to call multiple times."""
+        self._ensure_loaded()
+
     @property
     def dim(self) -> int:
         self._ensure_loaded()
