@@ -55,14 +55,24 @@ TOOL_ARGS_SCHEMAS = {
   "case_insensitive": <true|false>,
   "regex":            <true|false>,
   "max_results":      <integer, default 40>,
+  "after_lines":      <integer 0..20, default 0 — lines AFTER each match>,
+  "before_lines":     <integer 0..5, default 0 — lines BEFORE each match>,
   "include_sessions": <true|false, default false>
-}""",
+}
+Use after_lines/before_lines when you want surrounding code (e.g. body of a function or DAO).
+Tune the window: ~5–10 lines for a function signature hit, up to 20 for a longer block.""",
     "semantic_search": """\
 {
-  "query":  "<search query — rewrite to code terminology, not the user's words>",
-  "k":      <integer, default 8>,
-  "filter": { "ext": ["<.kt>", ...] }   (optional)
-}""",
+  "queries":       ["<angle 1>", "<angle 2 — OPTIONAL second phrasing>"],   ← preferred (1–2 phrases)
+  "query":         "<single angle — used only if queries is omitted>",       ← back-compat
+  "k":             <integer 1..16, default 8 — TOTAL across both queries>,
+  "min_score":     <float 0.0..1.0, default 0.30 — hits below are dropped before fusion>,
+  "include_graph": <true|false, default true — also score graph-node summaries>,
+  "filter":        { "ext": ["<.kt>", ...] }   (optional)
+}
+Two queries are FUSED (score-descending, deduped). Each hit must meet min_score.
+Pick distinct ANGLES, not paraphrases — e.g. ["Room @Entity @Dao Flow query insert",
+"PatientEntity ClinicalNode primary key foreign key"].""",
     "read_file": """\
 {
   "path":  "<relative path — required; use path not file_path>",
@@ -204,12 +214,46 @@ IMPORTANT — avoid redundant tool calls:
 """
 
 SEMANTIC_SEARCH_GUIDANCE = """\
-IMPORTANT — semantic_search query rewriting:
-When using semantic_search, do NOT echo the user's literal question as the query unless
-that exact wording matches how the code is written. Rewrite the query using identifiers,
-class names, package fragments, Gradle dependency names, Compose function names, or
-AndroidManifest tags that you would expect to find in the indexed code.
-Example: user asks "how are bookmarks saved?" → search for "BookmarksRepository insert Room DAO"
+IMPORTANT — semantic_search query design:
+
+semantic_search runs over TWO vector stores fused together:
+  1. Code chunks (every embeddable file, ~50–400 char windows of source).
+  2. Graph-node summaries (per-file LLM summaries + ogre_notes: imports,
+     composables, room_entities, viewmodels, suspend_fns, depends_on).
+
+Each hit has `source` = "chunk" or "graph". Graph hits are great for
+"what files are similar to X?" / "what does this codebase have for Y?".
+Chunk hits are great for "show me the exact code that does Z".
+
+Phrasing — never echo the user's literal question verbatim. Use the names
+the code actually uses (identifiers, class/package fragments, Room/Compose
+annotations, Gradle dependency tokens, manifest tags).
+
+You may supply up to TWO queries per call. Pick distinct ANGLES, not
+paraphrases — the second query should look from a different direction:
+
+  Architecture × data:
+    ["Application class Hilt DI component graph entry point",
+     "Room database @Entity @Dao Flow query insert"]
+
+  UI × state:
+    ["@Composable LazyColumn Card Scaffold TopAppBar Material3",
+     "ViewModel StateFlow collectAsStateWithLifecycle"]
+
+  Domain entity × persistence relation:
+    ["PatientEntity ClinicalNode ClinicalEdge primary key foreign key",
+     "Room TypeConverter Date schema migration"]
+
+Scoring:
+  - min_score floor (default 0.30) is applied BEFORE fusion. Below 0.30 is noise.
+  - If the result is just {"info": "No hits met the min_score floor."} try a
+    different angle OR lower min_score to 0.20 — do not call again with the
+    same words.
+  - k is the TOTAL cap across both queries (max 16). Default 8 is usually right.
+
+When to lean graph vs chunk:
+  - "What entities does this app have?" → include_graph=true, look for source=graph.
+  - "How is the search bar wired?" → chunk hits will surface the exact composable.
 """
 
 FILE_AUTHORING_RULES = """\
@@ -252,6 +296,19 @@ To get package, imports, and top-of-file comments without reading the whole file
   grep pattern="^(package|import|/\\*\\*|//)" path="app/src/main/.../PatientActivity.kt" max_results=40
 This reveals the dependency surface quickly (Room, Hilt, Compose, Coroutines, etc.)
 
+─── 2b. Grep with context (use your judgement) ─────────────────────────────
+You can ask grep for surrounding lines per match — DEFAULT is 0 (just the match).
+  after_lines:  0..20   lines AFTER each match
+  before_lines: 0..5    lines BEFORE each match
+
+Pick a window that fits the construct you are searching for. Examples:
+  Function signature → body:     after_lines=10   (or 20 for long bodies)
+  Annotation → declaration:      after_lines=3 before_lines=1
+  XML opening tag → attributes:  after_lines=5
+  Single-line constants:         after_lines=0   (just the match)
+
+Two well-targeted greps with after_lines=10 usually beat one read_file of 200 lines.
+
 ─── 3. Grep for Kotlin / Android patterns ──────────────────────────────────
 Use targeted patterns to locate features across the whole project:
 
@@ -278,9 +335,16 @@ Use targeted patterns to locate features across the whole project:
 
 Run ONE pattern at a time; pick the one most relevant to the user's question.
 
-─── 4. Varied semantic_search angles ───────────────────────────────────────
-Never send the user's raw question as the query. Pick an angle:
+─── 4. Dual-angle semantic_search ──────────────────────────────────────────
+semantic_search fuses TWO vector stores (code chunks + graph-node summaries)
+and accepts up to TWO queries per call. Never echo the user's raw question.
 
+Prefer one call with TWO distinct angles over two separate calls:
+  semantic_search queries=["Application class Hilt DI entry point",
+                            "Room database @Entity @Dao Flow"]
+                  k=10 min_score=0.30
+
+Angle library:
   Architecture / wiring:
     "Application class Hilt DI component graph entry point"
     "NavGraph NavHost destination route composable screen"
@@ -297,7 +361,12 @@ Never send the user's raw question as the query. Pick an angle:
     "PatientActivity ClinicalNode ClinicalEdge patient graph Room"
     "patient dashboard search filter clinical data ViewModel"
 
-Run two angles if the first returns fewer than 3 useful hits.
+Inspect `source` on each hit:
+  • "chunk"  → exact code lines (use read_file / graph_lookup to expand).
+  • "graph"  → whole-file summaries (use graph_lookup on `file` to map dependencies).
+
+If a call returns "No hits met the min_score floor", change the angle BEFORE
+retrying. Repeating the same words with a lower floor rarely helps.
 
 ─── 5. Chunked file reading ────────────────────────────────────────────────
 For large files (> 300 lines), read in sections rather than all at once:
@@ -407,6 +476,8 @@ You are codescope, assistant for Android project "{project_name}". Use tools the
 {RESPONSE_SCHEMA}
 
 {FILE_AUTHORING_RULES}
+
+{SEMANTIC_SEARCH_GUIDANCE}
 
 {CODEBASE_QUERY_TACTICS}
 

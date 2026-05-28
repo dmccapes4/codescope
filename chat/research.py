@@ -175,9 +175,14 @@ def _note_from_result(tool: str, args: dict, result: Any, max_len: int = 600) ->
         return f"{len(result)} matches. Top: " + ", ".join(lines[:8])
     if tool == "semantic_search" and isinstance(result, list):
         parts = []
-        for r in result[:6]:
-            if isinstance(r, dict):
-                parts.append(f"{r.get('file', '?')} (score {r.get('score', 0):.2f})")
+        for r in result[:8]:
+            if not isinstance(r, dict):
+                continue
+            if r.get("info"):
+                parts.append(r["info"])
+                continue
+            tag = r.get("source", "?")
+            parts.append(f"[{tag}] {r.get('file', '?')} ({r.get('score', 0):.2f})")
         return "Hits: " + "; ".join(parts)
     if tool == "graph_lookup":
         text = json.dumps(result, ensure_ascii=False)[:max_len]
@@ -300,24 +305,28 @@ def run_codebase_research(
             )
 
     probes: list[tuple[str, dict]] = [
-        # Semantic broad sweep
+        # Semantic sweep — dual angle, fuses chunk + graph node embeddings
         ("semantic_search", {
-            "query": _research_semantic_query(user_query),
-            "k": 10,
+            "queries":       _research_semantic_queries(user_query),
+            "k":             12,
+            "min_score":     0.30,
+            "include_graph": True,
         }),
         # Enumerate every Activity/Fragment/ViewModel/Entity class declaration
         ("grep", {
-            "pattern": r"class\s+\w+(Activity|Fragment|ViewModel|Repository)\b",
-            "path": ".",
-            "regex": True,
+            "pattern":     r"class\s+\w+(Activity|Fragment|ViewModel|Repository)\b",
+            "path":        ".",
+            "regex":       True,
             "max_results": 40,
+            "after_lines": 2,
         }),
-        # Enumerate every Room entity and DAO
+        # Enumerate every Room entity and DAO with a small signature window
         ("grep", {
-            "pattern": r"@(Entity|Dao|Database)\b",
-            "path": ".",
-            "regex": True,
+            "pattern":     r"@(Entity|Dao|Database)\b",
+            "path":        ".",
+            "regex":       True,
             "max_results": 30,
+            "after_lines": 4,
         }),
     ]
 
@@ -389,10 +398,28 @@ def run_codebase_research(
             )
 
 
-def _research_semantic_query(user_query: str) -> str:
+def _research_semantic_queries(user_query: str) -> list[str]:
+    """Two distinct ANGLES for the codebase research probe.
+
+    First angle: architecture / wiring (high-level — favors graph hits).
+    Second angle: domain / data (specific — favors chunk hits).
+    """
     q = user_query.lower()
     if "readme" in q:
-        return "Android project structure main activity application entry point gradle"
+        return [
+            "Application class Hilt entry point Activity manifest gradle modules",
+            "Room database @Entity @Dao Flow repository ViewModel StateFlow",
+        ]
     if "patient" in q:
-        return "PatientActivity Patient dashboard Room ClinicalNode ViewModel"
-    return "Android Kotlin main application architecture Room Compose"
+        return [
+            "PatientActivity ViewModel StateFlow Compose Scaffold LazyColumn",
+            "PatientEntity ClinicalNode ClinicalEdge primary key foreign key Room",
+        ]
+    return [
+        "Android Kotlin Application architecture Compose navigation",
+        "Room database @Entity @Dao repository ViewModel Flow",
+    ]
+
+
+def _research_semantic_query(user_query: str) -> str:  # back-compat
+    return _research_semantic_queries(user_query)[0]

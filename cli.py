@@ -756,11 +756,17 @@ def cmd_search(
 
     console.print(f"\n[dim]Top {len(results)} matches for:[/dim] [bold]{query}[/bold]\n")
     for i, r in enumerate(results, 1):
-        lines = r.get("lines") or []
-        line_s = f"L{lines[0]}–{lines[1]}" if len(lines) == 2 else ""
+        if r.get("info"):
+            console.print(f"  [yellow]{r['info']}[/yellow] (min_score={r.get('min_score', 0):.2f})")
+            continue
+        src    = r.get("source", "?")
+        lines  = r.get("lines") or []
+        line_s = f"L{lines[0]}–{lines[1]}" if isinstance(lines, list) and len(lines) == 2 else ""
+        target = r.get("file") if src != "graph" else (r.get("node_id") or r.get("file", "?"))
         console.print(
-            f"  [bold cyan]{i:>2}.[/bold cyan] [cyan]{r['file']}[/cyan]  "
-            f"[dim]{line_s}[/dim]  [yellow]score={r['score']:.3f}[/yellow]"
+            f"  [bold cyan]{i:>2}.[/bold cyan] [magenta][{src}][/magenta] "
+            f"[cyan]{target}[/cyan]  [dim]{line_s}[/dim]  "
+            f"[yellow]score={r.get('score', 0):.3f}[/yellow]"
         )
         if r.get("snippet"):
             snippet = r["snippet"][:200].replace("\n", " ")

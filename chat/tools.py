@@ -38,12 +38,18 @@ def _assert_safe_path(base: Path, rel: str) -> Path:
 # grep
 # ---------------------------------------------------------------------------
 
+GREP_AFTER_MAX  = 20
+GREP_BEFORE_MAX = 5
+
+
 def _grep_python(
     pattern: str,
     search_root: Path,
     case_insensitive: bool,
     is_regex: bool,
     max_results: int,
+    after_lines: int = 0,
+    before_lines: int = 0,
 ) -> list[dict]:
     flags = re.IGNORECASE if case_insensitive else 0
     try:
@@ -51,7 +57,7 @@ def _grep_python(
     except re.error as e:
         raise ToolError(f"Invalid regex: {e}")
 
-    results = []
+    results: list[dict] = []
     for dirpath, dirnames, filenames in os.walk(search_root):
         dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIRS and not d.startswith(".")]
         for name in filenames:
@@ -63,10 +69,23 @@ def _grep_python(
                 lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue
+            total = len(lines)
             for lineno, line in enumerate(lines, 1):
                 if rx.search(line):
                     rel = fp.relative_to(search_root).as_posix()
-                    results.append({"file": rel, "line": lineno, "text": line.rstrip()})
+                    rec: dict[str, Any] = {
+                        "file": rel,
+                        "line": lineno,
+                        "text": line.rstrip(),
+                    }
+                    if after_lines > 0 or before_lines > 0:
+                        b_start = max(1, lineno - before_lines)
+                        a_end   = min(total, lineno + after_lines)
+                        ctx = lines[b_start - 1 : a_end]
+                        rec["context_start"] = b_start
+                        rec["context_end"]   = a_end
+                        rec["context"]       = "\n".join(l.rstrip() for l in ctx)
+                    results.append(rec)
                     if len(results) >= max_results:
                         return results
     return results
@@ -78,6 +97,8 @@ def tool_grep(
     case_insensitive: bool = False,
     regex: bool = True,
     max_results: int = 40,
+    after_lines: int = 0,
+    before_lines: int = 0,
     include_sessions: bool = False,
     project_root: Path | None = None,
     session_dir: Path | None = None,
@@ -85,11 +106,16 @@ def tool_grep(
     if not project_root:
         raise ToolError("project_root not set")
 
+    # Clamp context window to hard caps so a single grep can't blow the budget.
+    after_lines  = max(0, min(int(after_lines  or 0), GREP_AFTER_MAX))
+    before_lines = max(0, min(int(before_lines or 0), GREP_BEFORE_MAX))
+
     search_root = _assert_safe_path(project_root, path)
     if not search_root.exists():
         raise ToolError(f"Path does not exist: {path}")
 
-    rg_bin = shutil.which("rg")
+    needs_context = after_lines > 0 or before_lines > 0
+    rg_bin = shutil.which("rg") if not needs_context else None  # python path handles context
     if rg_bin:
         cmd = [rg_bin, "--line-number", "--with-filename", "--no-heading",
                "--max-count", str(max_results)]
@@ -115,51 +141,262 @@ def tool_grep(
                 if len(results) >= max_results:
                     break
         except Exception:
-            results = _grep_python(pattern, search_root, case_insensitive, regex, max_results)
+            results = _grep_python(
+                pattern, search_root, case_insensitive, regex, max_results,
+                after_lines=after_lines, before_lines=before_lines,
+            )
     else:
-        results = _grep_python(pattern, search_root, case_insensitive, regex, max_results)
+        results = _grep_python(
+            pattern, search_root, case_insensitive, regex, max_results,
+            after_lines=after_lines, before_lines=before_lines,
+        )
 
-    # Optionally also grep session logs
+    # Optionally also grep session logs (no context for sessions — keep small)
     if include_sessions and session_dir and session_dir.exists():
-        results += _grep_python(pattern, session_dir, case_insensitive, regex,
-                                 max(0, max_results - len(results)))
+        results += _grep_python(
+            pattern, session_dir, case_insensitive, regex,
+            max(0, max_results - len(results)),
+        )
 
     return results[:max_results]
 
 
 # ---------------------------------------------------------------------------
-# semantic_search
+# semantic_search  (dual-query, fuses chunk + graph-node embeddings)
 # ---------------------------------------------------------------------------
 
+SEMANTIC_K_MAX        = 16     # hard cap across both queries combined
+SEMANTIC_MIN_SCORE    = 0.30   # default floor — qualify before fusion
+SEMANTIC_QUERIES_MAX  = 2      # at most 2 angles per call
+
+
+def _graph_vectors_paths(cache_dir: Path) -> tuple[Path, Path, Path]:
+    return (
+        cache_dir / "graph_embeddings.npy",
+        cache_dir / "graph_embeddings.meta.jsonl",
+        cache_dir / "graph.nodes.jsonl",
+    )
+
+
+def _node_embed_text(node: dict) -> str:
+    """Compose a small text block per graph node for embedding."""
+    parts: list[str] = []
+    kind = node.get("kind", "")
+    file = node.get("file", "")
+    if kind or file:
+        parts.append(f"{kind} {file}".strip())
+    summary = (node.get("summary") or "").strip()
+    if summary:
+        parts.append(summary)
+    notes = node.get("ogre_notes") or {}
+    if isinstance(notes, dict):
+        for label, key in (
+            ("imports", "imports"),
+            ("exports", "exports"),
+            ("composables", "composables"),
+            ("entities", "room_entities"),
+            ("viewmodels", "viewmodels"),
+            ("suspend", "suspend_fns"),
+            ("depends_on", "depends_on"),
+        ):
+            vals = notes.get(key) or []
+            if isinstance(vals, list) and vals:
+                joined = ", ".join(str(v) for v in vals[:12])
+                parts.append(f"{label}: {joined}")
+    return "\n".join(parts).strip()
+
+
+def _ensure_graph_vectors(cache_dir: Path, embedder) -> tuple[np.ndarray | None, list[dict]]:
+    """Lazy-build graph_embeddings.npy from graph.nodes.jsonl. Returns (matrix, meta) or (None, [])."""
+    npy_path, meta_path, nodes_path = _graph_vectors_paths(cache_dir)
+    if not nodes_path.exists():
+        return None, []
+
+    stale = (
+        not npy_path.exists()
+        or not meta_path.exists()
+        or nodes_path.stat().st_mtime > npy_path.stat().st_mtime
+    )
+
+    if not stale:
+        try:
+            matrix = np.load(str(npy_path))
+            meta: list[dict] = []
+            with open(meta_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            meta.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+            if matrix.shape[0] == len(meta) and matrix.shape[0] > 0:
+                return matrix, meta
+        except Exception:
+            pass  # fall through to rebuild
+
+    # Build fresh
+    texts: list[str] = []
+    meta: list[dict] = []
+    with open(nodes_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                node = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = _node_embed_text(node)
+            if not text:
+                continue
+            texts.append(text)
+            meta.append({
+                "node_id": node.get("id", ""),
+                "file":    node.get("file", ""),
+                "kind":    node.get("kind", ""),
+                "summary": (node.get("summary") or "")[:300],
+            })
+
+    if not texts:
+        return None, []
+
+    vecs = embedder.encode(texts)
+    np.save(str(npy_path), vecs.astype(np.float32))
+    with open(meta_path, "w", encoding="utf-8") as f:
+        for m in meta:
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+    return vecs.astype(np.float32), meta
+
+
+def _search_chunks(
+    cache_dir: Path,
+    query_vec: np.ndarray,
+    k: int,
+    ext_filter: list[str] | None,
+) -> list[dict]:
+    matrix, meta = vectors_load(cache_dir)
+    if matrix is None or matrix.shape[0] == 0:
+        return []
+    hits = vectors_search(matrix, meta, query_vec, k=k, filter_ext=ext_filter)
+    out = []
+    for h in hits:
+        out.append({
+            "source":  "chunk",
+            "file":    h["file"],
+            "lines":   h["lines"],
+            "score":   float(h["score"]),
+            "symbol":  h.get("symbol", ""),
+            "snippet": (h.get("chunk_text") or "")[:300],
+        })
+    return out
+
+
+def _search_graph(
+    cache_dir: Path,
+    embedder,
+    query_vec: np.ndarray,
+    k: int,
+) -> list[dict]:
+    matrix, meta = _ensure_graph_vectors(cache_dir, embedder)
+    if matrix is None or matrix.shape[0] == 0:
+        return []
+    scores = matrix @ query_vec
+    order = np.argsort(scores)[::-1][:k]
+    out = []
+    for idx in order:
+        m = meta[int(idx)]
+        out.append({
+            "source":  "graph",
+            "file":    m.get("file", ""),
+            "node_id": m.get("node_id", ""),
+            "kind":    m.get("kind", ""),
+            "score":   float(scores[int(idx)]),
+            "snippet": (m.get("summary") or "")[:300],
+        })
+    return out
+
+
 def tool_semantic_search(
-    query: str,
+    query: str | None = None,
+    queries: list[str] | None = None,
     k: int = 8,
+    min_score: float = SEMANTIC_MIN_SCORE,
+    include_graph: bool = True,
     filter: dict | None = None,
     cache_dir: Path | None = None,
     embedder=None,
 ) -> list[dict]:
+    """Dense search over chunk embeddings and (optionally) graph-node embeddings.
+
+    Pass either:
+      - query="..." (single angle), or
+      - queries=["...", "..."]  (up to 2 angles — preferred when you can think
+        of distinct phrasings; results are fused score-descending and deduped).
+
+    All hits must score ≥ min_score (default 0.30). Total results capped at k
+    (max 16 across all queries / sources).
+    """
     if not cache_dir or not embedder:
         raise ToolError("cache_dir and embedder required")
 
-    matrix, meta = vectors_load(cache_dir)
-    if matrix is None or matrix.shape[0] == 0:
-        return [{"error": "No embeddings found. Run `codescope index --embed --project <name>` first."}]
+    # Normalize the query list ─────────────────────────────────────────────
+    q_list: list[str] = []
+    if queries:
+        for q in queries:
+            if isinstance(q, str) and q.strip():
+                q_list.append(q.strip())
+    if not q_list and query and isinstance(query, str) and query.strip():
+        q_list.append(query.strip())
+    q_list = q_list[:SEMANTIC_QUERIES_MAX]
+    if not q_list:
+        raise ToolError("semantic_search requires `query` or `queries`")
 
-    query_vec = embedder.encode_query(query)
-    ext_filter = (filter or {}).get("ext")
+    k = max(1, min(int(k or 8), SEMANTIC_K_MAX))
+    try:
+        min_score = float(min_score)
+    except (TypeError, ValueError):
+        min_score = SEMANTIC_MIN_SCORE
+    ext_filter = (filter or {}).get("ext") if isinstance(filter, dict) else None
 
-    hits = vectors_search(matrix, meta, query_vec, k=k, filter_ext=ext_filter)
+    # Per-query budgets — over-fetch then floor + fuse ─────────────────────
+    chunk_per_q = max(k, 8)
+    graph_per_q = max(k // 2, 4)
 
-    results = []
-    for h in hits:
-        results.append({
-            "file":    h["file"],
-            "lines":   h["lines"],
-            "score":   round(h["score"], 4),
-            "symbol":  h["symbol"],
-            "snippet": h["chunk_text"][:300] if h.get("chunk_text") else "",
-        })
-    return results
+    pool: dict[str, dict] = {}
+
+    def _key(rec: dict) -> str:
+        if rec["source"] == "graph":
+            return f"graph::{rec.get('node_id') or rec.get('file', '')}"
+        lines = rec.get("lines") or []
+        line_tag = f"{lines[0]}-{lines[-1]}" if isinstance(lines, list) and lines else "?"
+        return f"chunk::{rec.get('file', '')}::{line_tag}::{rec.get('symbol', '')}"
+
+    for q in q_list:
+        q_vec = embedder.encode_query(q)
+        chunks = _search_chunks(cache_dir, q_vec, chunk_per_q, ext_filter)
+        graphs = _search_graph(cache_dir, embedder, q_vec, graph_per_q) if include_graph else []
+        for rec in chunks + graphs:
+            if rec["score"] < min_score:
+                continue
+            rec["matched_query"] = q
+            key = _key(rec)
+            prev = pool.get(key)
+            if prev is None or rec["score"] > prev["score"]:
+                pool[key] = rec
+
+    fused = sorted(pool.values(), key=lambda r: r["score"], reverse=True)[:k]
+    for r in fused:
+        r["score"] = round(r["score"], 4)
+
+    if not fused:
+        return [{
+            "info": "No hits met the min_score floor.",
+            "queries": q_list,
+            "min_score": min_score,
+            "hint": "Lower min_score (e.g. 0.20) or try a different angle.",
+        }]
+    return fused
 
 
 # ---------------------------------------------------------------------------
@@ -997,8 +1234,41 @@ def normalize_tool_args(tool_name: str, args: dict) -> dict:
             else:
                 args["node"] = val
 
-    if tool_name == "grep" and "query" in args and "pattern" not in args:
-        args["pattern"] = args.pop("query")
+    if tool_name == "grep":
+        if "query" in args and "pattern" not in args:
+            args["pattern"] = args.pop("query")
+        for old, new in (
+            ("context_lines",      "after_lines"),
+            ("after",              "after_lines"),
+            ("context_after",      "after_lines"),
+            ("lines_after",        "after_lines"),
+            ("A",                  "after_lines"),
+            ("context_before",     "before_lines"),
+            ("before",             "before_lines"),
+            ("lines_before",       "before_lines"),
+            ("B",                  "before_lines"),
+        ):
+            if old in args and new not in args:
+                args[new] = args.pop(old)
+
+    if tool_name == "semantic_search":
+        # Accept "q" / "queries" / list-shaped "query"; also "min_score" aliases.
+        if "q" in args and "query" not in args and "queries" not in args:
+            val = args.pop("q")
+            args["queries" if isinstance(val, list) else "query"] = val
+        if "query" in args and isinstance(args["query"], list):
+            args["queries"] = args.pop("query")
+        for old, new in (
+            ("score_min",     "min_score"),
+            ("threshold",     "min_score"),
+            ("min_similarity", "min_score"),
+            ("top_k",         "k"),
+            ("limit",         "k"),
+            ("graph",         "include_graph"),
+        ):
+            if old in args and new not in args:
+                args[new] = args.pop(old)
+
     if tool_name == "web_search" and "q" in args and "query" not in args:
         args["query"] = args.pop("q")
 

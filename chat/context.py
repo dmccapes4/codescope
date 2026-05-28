@@ -183,14 +183,25 @@ def _format_research(tool_results: list[dict]) -> str:
                 parts.append(f"### grep({pat!r})\n" + "\n".join(lines))
         elif name == "semantic_search" and isinstance(result, list) and result:
             lines = []
-            for r in result[:8]:
+            for r in result[:10]:
                 if not isinstance(r, dict):
                     continue
-                snippet = str(r.get("snippet") or r.get("text", "")).strip().replace("\n", " ")
-                lines.append(
-                    f"  {r.get('file')} lines {r.get('lines','?')} "
-                    f"(score {r.get('score', 0):.2f}): {snippet[:120]}"
-                )
+                if r.get("info"):
+                    lines.append(f"  [no hits ≥ {r.get('min_score', 0):.2f}] {r.get('info', '')}")
+                    continue
+                src = r.get("source", "?")
+                snippet = str(r.get("snippet") or "").strip().replace("\n", " ")
+                if src == "graph":
+                    loc = r.get("node_id") or r.get("file", "?")
+                    lines.append(
+                        f"  [{src}] {loc} (score {r.get('score', 0):.2f}): {snippet[:120]}"
+                    )
+                else:
+                    line_tag = r.get("lines", "?")
+                    lines.append(
+                        f"  [{src}] {r.get('file', '?')} lines {line_tag} "
+                        f"(score {r.get('score', 0):.2f}): {snippet[:120]}"
+                    )
             if lines:
                 parts.append("### semantic_search\n" + "\n".join(lines))
         elif name == "graph_lookup":

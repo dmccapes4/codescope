@@ -69,6 +69,15 @@ Do NOT substitute codescope edit_file or Cursor search_replace shapes.
 - You only need to add one import or change a few lines — use replace tools, not full-file write_file.
 - You do not have the full file content in context — read/view the file first (via IDE context or read tools), then patch.
 
+## Retrieval discipline (search before editing)
+
+Before you propose changes, gather evidence. Use the IDE's search tools — never invent file paths or symbols.
+
+1. Prefer TWO complementary searches over one: a high-level architecture query AND a specific domain/identifier query. Distinct ANGLES beat paraphrases.
+2. When you grep / search-in-files, ask for a context window appropriate to what you are looking for: a function signature usually needs ~5–10 lines after; an annotation needs 2–4. Don't read whole files when 10 lines suffice.
+3. Drop low-confidence hits. If a search returns nothing relevant, change the angle (different identifier, different layer) instead of repeating the same words.
+4. Quote the file path and the lines you relied on in your reply so the user can verify.
+
 Be concise. Ask one clarifying question only when blocked."""
 
 # Few-shot: one line per MESSAGE (blank lines inside MESSAGE break ollama create)
