@@ -27,6 +27,7 @@ class LLM:
         base_url: str = OLLAMA_BASE_URL,
         timeout: float | None = None,
         num_gpu: int | None = None,
+        num_ctx: int | None = None,
     ):
         self.model    = model
         self.base_url = base_url.rstrip("/")
@@ -34,6 +35,10 @@ class LLM:
         # Per-instance GPU layer override.  None → use OLLAMA_NUM_GPU global.
         # Set to 0 to run a model entirely on CPU (e.g. planner on 6 GB VRAM).
         self._num_gpu = num_gpu
+        # Per-instance context window override (None → fall back to OLLAMA_NUM_CTX
+        # from config).  Used by the connectivity fallback so a local 7B doesn't
+        # try to honor a 32K context that's only safe on the workstation.
+        self._num_ctx = num_ctx
 
     # ------------------------------------------------------------------
     # Health check
@@ -74,7 +79,7 @@ class LLM:
                 "num_predict": num_predict,
                 "temperature": temperature,
                 "num_gpu":     OLLAMA_NUM_GPU if self._num_gpu is None else self._num_gpu,
-                "num_ctx":     OLLAMA_NUM_CTX,
+                "num_ctx":     OLLAMA_NUM_CTX if self._num_ctx is None else self._num_ctx,
             },
         }
         if system:

@@ -34,6 +34,7 @@ Design conventions (FullMetalPacket-inspired)
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -144,6 +145,58 @@ def _check_ollama(llm) -> None:
             f"[red]Ollama not reachable at {llm.base_url}[/red]\n"
             "Start with: [bold]ollama serve &[/bold]"
         )
+
+
+def _resolve_host_for_chat(llm_model: str) -> dict:
+    """Probe OLLAMA_HOST; if unreachable, transparently fall back to a local server.
+
+    Mutates os.environ to redirect later `from .config import ...` reads. Returns a
+    dict with the resolved base_url, model name, and num_ctx — caller passes those
+    directly to LLM() so the choice survives independently of config-module caching.
+    """
+    from .chat.connectivity import (
+        resolve_ollama_host,
+        apply_resolution_to_env,
+        DEFAULT_FALLBACK_HOST,
+    )
+    from .config import DEFAULT_LLM as _CFG_DEFAULT_LLM
+
+    # If the user typed a value different from config.DEFAULT_LLM, treat that as explicit.
+    user_supplied = llm_model and llm_model != _CFG_DEFAULT_LLM
+
+    resolved = resolve_ollama_host(
+        requested_model = llm_model or None,
+        primary_url     = os.environ.get("OLLAMA_HOST"),
+        fallback_url    = os.environ.get("CODESCOPE_FALLBACK_HOST", DEFAULT_FALLBACK_HOST),
+    )
+
+    if resolved.is_degraded():
+        apply_resolution_to_env(resolved, user_supplied_model=user_supplied)
+        console.print(
+            f"[yellow]⚠  Primary Ollama unreachable — degraded to local fallback.[/yellow]\n"
+            f"  [dim]reason:[/dim]  {resolved.reason}\n"
+            f"  [dim]host:[/dim]    [cyan]{resolved.base_url}[/cyan]\n"
+            f"  [dim]model:[/dim]   [cyan]{resolved.model or '(none picked)'}[/cyan]\n"
+            f"  [dim]num_ctx:[/dim] [cyan]{resolved.num_ctx}[/cyan]  "
+            f"[dim]profile:[/dim] [cyan]{resolved.profile}[/cyan]"
+        )
+        return {
+            "base_url": resolved.base_url,
+            "model":    resolved.model or llm_model,
+            "num_ctx":  resolved.num_ctx or None,
+        }
+
+    # Primary is alive — still print one line so the user sees which host won.
+    if resolved.models_available is not None:
+        console.print(
+            f"[dim]Ollama:[/dim] [cyan]{resolved.base_url}[/cyan]  "
+            f"[dim]({len(resolved.models_available)} models available)[/dim]"
+        )
+    return {
+        "base_url": resolved.base_url,
+        "model":    llm_model,
+        "num_ctx":  None,   # let config.py decide
+    }
         raise typer.Exit(1)
 
 
@@ -844,6 +897,8 @@ def cmd_chat(
     hitl:          bool = _hitl_opt(),
 ):
     """Start an interactive chat REPL for a project."""
+    host = _resolve_host_for_chat(llm_model)
+
     from . import projects as P
     from .models.llm import LLM
     from .models.embedder import Embedder
@@ -854,7 +909,7 @@ def cmd_chat(
     session_dir  = P.session_dir(project)
     _check_index(project, cache_dir)
 
-    llm      = LLM(model=llm_model)
+    llm      = LLM(model=host["model"], base_url=host["base_url"], num_ctx=host["num_ctx"])
     embedder = Embedder(model_name=embedder_name)
     _check_ollama(llm)
 
@@ -880,6 +935,8 @@ def cmd_ask(
     hitl:          bool = _hitl_opt(),
 ):
     """Ask a single question and print the answer (no REPL)."""
+    host = _resolve_host_for_chat(llm_model)
+
     from . import projects as P
     from .models.llm import LLM
     from .models.embedder import Embedder
@@ -890,7 +947,7 @@ def cmd_ask(
     session_dir  = P.session_dir(project)
     _check_index(project, cache_dir)
 
-    llm      = LLM(model=llm_model)
+    llm      = LLM(model=host["model"], base_url=host["base_url"], num_ctx=host["num_ctx"])
     embedder = Embedder(model_name=embedder_name)
     _check_ollama(llm)
 
