@@ -148,55 +148,23 @@ def _check_ollama(llm) -> None:
 
 
 def _resolve_host_for_chat(llm_model: str) -> dict:
-    """Probe OLLAMA_HOST; if unreachable, transparently fall back to a local server.
+    """Verify local Ollama is up. codescope uses localhost only — no remote fallback."""
+    from .config import OLLAMA_BASE_URL
+    from .chat.connectivity import probe_ollama
 
-    Mutates os.environ to redirect later `from .config import ...` reads. Returns a
-    dict with the resolved base_url, model name, and num_ctx — caller passes those
-    directly to LLM() so the choice survives independently of config-module caching.
-    """
-    from .chat.connectivity import (
-        resolve_ollama_host,
-        apply_resolution_to_env,
-        DEFAULT_FALLBACK_HOST,
-    )
-    from .config import DEFAULT_LLM as _CFG_DEFAULT_LLM
-
-    # If the user typed a value different from config.DEFAULT_LLM, treat that as explicit.
-    user_supplied = llm_model and llm_model != _CFG_DEFAULT_LLM
-
-    resolved = resolve_ollama_host(
-        requested_model = llm_model or None,
-        primary_url     = os.environ.get("OLLAMA_HOST"),
-        fallback_url    = os.environ.get("CODESCOPE_FALLBACK_HOST", DEFAULT_FALLBACK_HOST),
-    )
-
-    if resolved.is_degraded():
-        apply_resolution_to_env(resolved, user_supplied_model=user_supplied)
+    base_url = OLLAMA_BASE_URL.rstrip("/")
+    models = probe_ollama(base_url)
+    if models is not None:
         console.print(
-            f"[yellow]⚠  Primary Ollama unreachable — degraded to local fallback.[/yellow]\n"
-            f"  [dim]reason:[/dim]  {resolved.reason}\n"
-            f"  [dim]host:[/dim]    [cyan]{resolved.base_url}[/cyan]\n"
-            f"  [dim]model:[/dim]   [cyan]{resolved.model or '(none picked)'}[/cyan]\n"
-            f"  [dim]num_ctx:[/dim] [cyan]{resolved.num_ctx}[/cyan]  "
-            f"[dim]profile:[/dim] [cyan]{resolved.profile}[/cyan]"
+            f"[dim]Ollama:[/dim] [cyan]{base_url}[/cyan]  "
+            f"[dim]({len(models)} models available)[/dim]"
         )
-        return {
-            "base_url": resolved.base_url,
-            "model":    resolved.model or llm_model,
-            "num_ctx":  resolved.num_ctx or None,
-        }
-
-    # Primary is alive — still print one line so the user sees which host won.
-    if resolved.models_available is not None:
+    else:
         console.print(
-            f"[dim]Ollama:[/dim] [cyan]{resolved.base_url}[/cyan]  "
-            f"[dim]({len(resolved.models_available)} models available)[/dim]"
+            f"[yellow]⚠  Ollama not reachable at {base_url}[/yellow]\n"
+            "  Start locally: [bold]ollama serve[/bold]"
         )
-    return {
-        "base_url": resolved.base_url,
-        "model":    llm_model,
-        "num_ctx":  None,   # let config.py decide
-    }
+    return {"base_url": base_url, "model": llm_model, "num_ctx": None}
 
 
 def _resolve(project: str) -> Path:

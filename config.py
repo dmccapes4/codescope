@@ -21,28 +21,35 @@ SESSIONS_ROOT = WORKSPACE_ROOT / "sessions"
 # ---------------------------------------------------------------------------
 # Hardware profiles — set CODESCOPE_PROFILE or override individual vars.
 #
-#   laptop-6gb   (default) RTX 4050 6 GB
+#   desktop-12gb   (default) i7 / RTX 3060 12 GB — local Ollama only
+#     LLM    : qwen2.5-coder:14b-instruct-q4_K_M  (~9 GB weights)
+#     ctx    : 32 768  (14B KV ≈ 3.3 GB → ~12.3 GB total on GPU)
+#     embed  : cuda
+#
+#   laptop-6gb     RTX 4050 6 GB
 #     LLM    : qwen2.5-coder:7b-instruct-q4_K_M
-#     ctx    : 12 288  (all 29 layers on GPU; leaves ~350 MB headroom)
-#     planner: deterministic (USE_PLANNER_LLM=0)
+#     ctx    : 12 288
 #     embed  : cpu
 #
-#   workstation-24gb        i9 / RTX 4090 24 GB
-#     LLM    : qwen2.5-coder:14b-instruct-q4_K_M  (9 GB weights)
-#     ctx    : 32 768  (14B KV ≈ 3.3 GB; llama3.2:3b planner ≈ 2 GB → ~16 GB total)
-#     planner: llama3.2:3b  (USE_PLANNER_LLM=1, PLANNER_SAME_MODEL=0)
+#   workstation-24gb   RTX 4090 24 GB (optional; not the default)
+#     LLM    : qwen2.5-coder:14b-instruct-q4_K_M
+#     ctx    : 65 536
 #     embed  : cuda
 #
 #   Override any value individually with its CODESCOPE_* env var.
 # ---------------------------------------------------------------------------
-_PROFILE = os.environ.get("CODESCOPE_PROFILE", "laptop-6gb").lower()
+_PROFILE = os.environ.get("CODESCOPE_PROFILE", "desktop-12gb").lower()
+_GPU_PROFILES = frozenset({"desktop-12gb", "workstation-24gb"})
 
 # Answer model
+_DEFAULT_LLM_BY_PROFILE = {
+    "workstation-24gb": "qwen2.5-coder:14b-instruct-q4_K_M",
+    "desktop-12gb":     "qwen2.5-coder:14b-instruct-q4_K_M",
+    "laptop-6gb":       "qwen2.5-coder:7b-instruct-q4_K_M",
+}
 DEFAULT_LLM = os.environ.get(
     "CODESCOPE_LLM",
-    "qwen2.5-coder:14b-instruct-q4_K_M"
-    if _PROFILE == "workstation-24gb"
-    else "qwen2.5-coder:7b-instruct-q4_K_M",
+    _DEFAULT_LLM_BY_PROFILE.get(_PROFILE, "qwen2.5-coder:14b-instruct-q4_K_M"),
 )
 
 # llama3.2:3b is the fast planner; :latest may resolve to a larger tag on some hosts.
@@ -83,13 +90,13 @@ DEFAULT_EMBEDDER = "sentence-transformers/all-MiniLM-L6-v2"
 # On 24 GB: run on CUDA for faster batch encoding during curation.
 EMBED_DEVICE = os.environ.get(
     "CODESCOPE_EMBED_DEVICE",
-    "cuda" if _PROFILE == "workstation-24gb" else "cpu",
+    "cuda" if _PROFILE in _GPU_PROFILES else "cpu",
 )
-OLLAMA_BASE_URL  = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+# Local Ollama only — codescope does not tunnel to a remote host.
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 
 # HTTP timeouts for Ollama /api/generate (seconds).
-# Remote tunneled 14B first load can exceed 120s; workstation profile defaults higher.
-_DEFAULT_LLM_TIMEOUT = "600" if _PROFILE == "workstation-24gb" else "120"
+_DEFAULT_LLM_TIMEOUT = "600" if _PROFILE == "workstation-24gb" else "180"
 LLM_TIMEOUT = float(os.environ.get("CODESCOPE_LLM_TIMEOUT", _DEFAULT_LLM_TIMEOUT))
 PLANNER_LLM_TIMEOUT = float(os.environ.get("CODESCOPE_PLANNER_TIMEOUT", str(min(LLM_TIMEOUT, 180))))
 
@@ -107,15 +114,17 @@ OLLAMA_NUM_GPU   = int(os.environ.get("CODESCOPE_NUM_GPU", "-1"))
 #     weights 4.46 GB + KV@12K 0.50 GB + compute 0.55 GB ≈ 5.5 GB  ✓  all layers on GPU
 #     KV@16K would push 21/29 layers to CPU → 3× slower generation
 #
-#   workstation-24gb  (RTX 4090 24 GB, qwen 14B Q4_K_M + llama3.2:3b):
-#     qwen14B base ≈ 9.0 GB + KV@64K ≈ 6.5 GB + llama3b ≈ 2.0 GB + compute ≈ 1.5 GB
-#       ≈ 19 GB  ✓  all layers on GPU, ~4-5 GB headroom for embedder + spikes.
-#     We need the 64 K window because a full Kotlin Activity rewrite (PRE-READ
-#     source files + research + a 200-line code block) does not fit at 32 K with
-#     ANSWER_NUM_PREDICT_WRITE ≥ 12000.
+#   desktop-12gb  (RTX 3060 12 GB, qwen 14B Q4_K_M):
+#     qwen14B base ≈ 9.0 GB + KV@32K ≈ 3.3 GB + compute ≈ 0.5 GB ≈ 12.8 GB
+#       → tight but fits; drop to CODESCOPE_NUM_CTX=24576 if you hit OOM.
 #
-#   Override:  CODESCOPE_NUM_CTX=32768 to revert (saves ~3.3 GB VRAM).
-_DEFAULT_CTX = "65536" if _PROFILE == "workstation-24gb" else "12288"
+#   workstation-24gb  (RTX 4090 24 GB): KV@64K for very large prompts.
+_DEFAULT_CTX_BY_PROFILE = {
+    "workstation-24gb": "65536",
+    "desktop-12gb":     "32768",
+    "laptop-6gb":       "12288",
+}
+_DEFAULT_CTX = _DEFAULT_CTX_BY_PROFILE.get(_PROFILE, "32768")
 OLLAMA_NUM_CTX = int(os.environ.get("CODESCOPE_NUM_CTX", _DEFAULT_CTX))
 
 # Answer generation limits (num_predict) — separate from context window.
@@ -129,6 +138,10 @@ if _PROFILE == "workstation-24gb":
     ANSWER_NUM_PREDICT         = int(os.environ.get("CODESCOPE_NUM_PREDICT",         "6000"))
     ANSWER_NUM_PREDICT_EXPLAIN = int(os.environ.get("CODESCOPE_NUM_PREDICT_EXPLAIN", "10000"))
     ANSWER_NUM_PREDICT_WRITE   = int(os.environ.get("CODESCOPE_NUM_PREDICT_WRITE",   "14000"))
+elif _PROFILE == "desktop-12gb":
+    ANSWER_NUM_PREDICT         = int(os.environ.get("CODESCOPE_NUM_PREDICT",         "5000"))
+    ANSWER_NUM_PREDICT_EXPLAIN = int(os.environ.get("CODESCOPE_NUM_PREDICT_EXPLAIN", "8000"))
+    ANSWER_NUM_PREDICT_WRITE   = int(os.environ.get("CODESCOPE_NUM_PREDICT_WRITE",   "10000"))
 else:
     ANSWER_NUM_PREDICT         = int(os.environ.get("CODESCOPE_NUM_PREDICT",         "2000"))
     ANSWER_NUM_PREDICT_EXPLAIN = int(os.environ.get("CODESCOPE_NUM_PREDICT_EXPLAIN", "2500"))

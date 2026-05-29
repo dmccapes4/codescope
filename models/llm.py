@@ -36,8 +36,7 @@ class LLM:
         # Set to 0 to run a model entirely on CPU (e.g. planner on 6 GB VRAM).
         self._num_gpu = num_gpu
         # Per-instance context window override (None → fall back to OLLAMA_NUM_CTX
-        # from config).  Used by the connectivity fallback so a local 7B doesn't
-        # try to honor a 32K context that's only safe on the workstation.
+        # Per-instance num_ctx override (None → use OLLAMA_NUM_CTX from config).
         self._num_ctx = num_ctx
 
     # ------------------------------------------------------------------
