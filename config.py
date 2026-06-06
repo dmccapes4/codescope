@@ -21,36 +21,66 @@ SESSIONS_ROOT = WORKSPACE_ROOT / "sessions"
 # ---------------------------------------------------------------------------
 # Hardware profiles — set CODESCOPE_PROFILE or override individual vars.
 #
-#   desktop-12gb   (default) i7 / RTX 3060 12 GB — local Ollama only
-#     LLM    : qwen2.5-coder:14b-instruct-q4_K_M  (~9 GB weights)
-#     ctx    : 32 768  (14B KV ≈ 3.3 GB → ~12.3 GB total on GPU)
-#     embed  : cuda
-#
-#   laptop-6gb     RTX 4050 6 GB
-#     LLM    : qwen2.5-coder:7b-instruct-q4_K_M
+#   laptop-6gb     (default) RTX 4050 6 GB
+#     LLM    : codescope:latest  (Modelfile on qwen2.5-coder:7b-instruct-q4_K_M)
 #     ctx    : 12 288
 #     embed  : cpu
 #
+#   desktop-12gb   i7 / RTX 3060 12 GB — local Ollama only
+#     LLM    : codescope:latest  (rebuild with CODESCOPE_PROFILE=desktop-12gb → 14b base)
+#
 #   workstation-24gb   RTX 4090 24 GB (optional; not the default)
-#     LLM    : qwen2.5-coder:14b-instruct-q4_K_M
+#     LLM    : codescope:latest
 #     ctx    : 65 536
 #     embed  : cuda
 #
 #   Override any value individually with its CODESCOPE_* env var.
 # ---------------------------------------------------------------------------
-_PROFILE = os.environ.get("CODESCOPE_PROFILE", "desktop-12gb").lower()
+_PROFILE = os.environ.get("CODESCOPE_PROFILE", "laptop-6gb").lower()
 _GPU_PROFILES = frozenset({"desktop-12gb", "workstation-24gb"})
+
+# codescope Ollama model built from modelfiles/codescope.Modelfile (see modelfiles/build.py).
+CODESCOPE_OLLAMA_MODEL = os.environ.get("CODESCOPE_OLLAMA_MODEL", "codescope:latest")
+# ProScope product/architect mode — modelfiles/proscope.Modelfile
+PROSCOPE_OLLAMA_MODEL = os.environ.get("PROSCOPE_OLLAMA_MODEL", "proscope:latest")
 
 # Answer model
 _DEFAULT_LLM_BY_PROFILE = {
-    "workstation-24gb": "qwen2.5-coder:14b-instruct-q4_K_M",
-    "desktop-12gb":     "qwen2.5-coder:14b-instruct-q4_K_M",
-    "laptop-6gb":       "qwen2.5-coder:7b-instruct-q4_K_M",
+    "workstation-24gb": CODESCOPE_OLLAMA_MODEL,
+    "desktop-12gb":     CODESCOPE_OLLAMA_MODEL,
+    "laptop-6gb":       CODESCOPE_OLLAMA_MODEL,
 }
 DEFAULT_LLM = os.environ.get(
     "CODESCOPE_LLM",
-    _DEFAULT_LLM_BY_PROFILE.get(_PROFILE, "qwen2.5-coder:14b-instruct-q4_K_M"),
+    _DEFAULT_LLM_BY_PROFILE.get(_PROFILE, CODESCOPE_OLLAMA_MODEL),
 )
+
+
+def is_codescope_instructor(model: str) -> bool:
+    """True when the model was built from codescope.Modelfile (system prompt is baked in)."""
+    base = model.split(":")[0].strip().lower()
+    return base == "codescope"
+
+
+def is_proscope_instructor(model: str) -> bool:
+    """True when the model was built from proscope.Modelfile."""
+    base = model.split(":")[0].strip().lower()
+    return base == "proscope"
+
+
+def is_instructor_model(model: str) -> bool:
+    """codescope or proscope Modelfile — do not override system prompt from Python."""
+    return is_codescope_instructor(model) or is_proscope_instructor(model)
+
+
+def codescope_base_model_for_profile(profile: str | None = None) -> str:
+    """Ollama base tag to build codescope:latest from for this hardware profile."""
+    p = (profile or _PROFILE).lower()
+    return {
+        "laptop-6gb":       "qwen2.5-coder:7b-instruct-q4_K_M",
+        "desktop-12gb":     "qwen2.5-coder:14b",
+        "workstation-24gb": "qwen2.5-coder:14b",
+    }.get(p, "qwen2.5-coder:7b-instruct-q4_K_M")
 
 # llama3.2:3b is the fast planner; :latest may resolve to a larger tag on some hosts.
 _DEFAULT_PLANNER = "llama3.2:3b" if _PROFILE == "workstation-24gb" else "llama3.2:latest"

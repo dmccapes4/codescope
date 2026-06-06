@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
-"""Cross-platform builder for the codescope Ollama instructor models.
+"""Cross-platform builder for codescope Ollama instructor models.
 
 Works on Linux, macOS, and Windows. Requires `python3` and `ollama` on PATH.
 
 Usage (from any directory):
     python codescope/modelfiles/build.py
-    python codescope/modelfiles/build.py --modelfile other.Modelfile --name other-model
+    python codescope/modelfiles/build.py --modelfile as-android-instructor.Modelfile
 
-Environment overrides (also honored when running with no args):
-    CODESCOPE_MODEL_NAME   default: as-android-instructor (or the Modelfile stem)
-    CODESCOPE_BASE_MODEL   default: keep the FROM line in the Modelfile
-                           e.g. set to "qwen2.5-coder:14b" for better tool JSON
+Build the codescope chat model (default):
+    python codescope/modelfiles/build.py
+    # → ollama create codescope -f codescope.Modelfile
+
+Build ProScope (product/architect mode):
+    python codescope/modelfiles/build.py --modelfile proscope.Modelfile --name proscope
+    # → ollama create proscope -f proscope.Modelfile
+
+Build the Android Studio instructor:
+    python codescope/modelfiles/build.py --modelfile as-android-instructor.Modelfile
+
+Environment overrides:
+    CODESCOPE_PROFILE      laptop-6gb → 7b base, desktop-12gb → 14b base (when --base unset)
+    CODESCOPE_MODEL_NAME   default: Modelfile stem (codescope or as-android-instructor)
+    CODESCOPE_BASE_MODEL   explicit override for the FROM line
 
 The script reads the Modelfile, optionally rewrites the FROM line based on
 CODESCOPE_BASE_MODEL, writes a temporary build file in the same directory, runs
@@ -27,6 +38,21 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+# Base model swapped in at build time when CODESCOPE_BASE_MODEL is unset.
+_BASE_BY_PROFILE: dict[str, str] = {
+    "laptop-6gb":       "qwen2.5-coder:7b-instruct-q4_K_M",
+    "desktop-12gb":     "qwen2.5-coder:14b",
+    "workstation-24gb": "qwen2.5-coder:14b",
+}
+
+
+def _default_base_model() -> str | None:
+    """Pick qwen base from CODESCOPE_PROFILE unless CODESCOPE_BASE_MODEL is set."""
+    if os.environ.get("CODESCOPE_BASE_MODEL"):
+        return None
+    profile = os.environ.get("CODESCOPE_PROFILE", "laptop-6gb").lower()
+    return _BASE_BY_PROFILE.get(profile)
 
 
 def _detect_ollama_host() -> str | None:
@@ -97,8 +123,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build a codescope Ollama instructor model.")
     parser.add_argument(
         "--modelfile",
-        default=str(HERE / "as-android-instructor.Modelfile"),
-        help="Path to the Modelfile (default: as-android-instructor.Modelfile next to this script).",
+        default=str(HERE / "codescope.Modelfile"),
+        help="Path to the Modelfile (default: codescope.Modelfile next to this script).",
     )
     parser.add_argument(
         "--name",
@@ -120,7 +146,7 @@ def main() -> int:
 
     mf = Path(args.modelfile).resolve()
     name = args.name or os.environ.get("CODESCOPE_MODEL_NAME") or mf.stem
-    base = args.base or os.environ.get("CODESCOPE_BASE_MODEL") or None
+    base = args.base or os.environ.get("CODESCOPE_BASE_MODEL") or _default_base_model()
 
     return build(mf, name, base)
 

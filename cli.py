@@ -9,7 +9,8 @@ Command groups
   reset             Wipe cache + sessions
   sessions          List saved chat sessions
 
-  chat              Interactive REPL
+  chat              Interactive REPL (engineer mode)
+  proscope          Product/architect REPL — phased docs in docs/
   ask               One-shot question
 
   grep              Run the grep tool directly (no LLM)
@@ -77,6 +78,11 @@ def _proj_opt():
 def _llm_opt():
     from .config import DEFAULT_LLM
     return typer.Option(DEFAULT_LLM, "--llm", help="Ollama model name")
+
+
+def _proscope_llm_opt():
+    from .config import PROSCOPE_OLLAMA_MODEL
+    return typer.Option(PROSCOPE_OLLAMA_MODEL, "--llm", help="Ollama model name (default: proscope:latest)")
 
 def _embedder_opt():
     from .config import DEFAULT_EMBEDDER
@@ -149,7 +155,7 @@ def _check_ollama(llm) -> None:
 
 def _resolve_host_for_chat(llm_model: str) -> dict:
     """Verify local Ollama is up. codescope uses localhost only — no remote fallback."""
-    from .config import OLLAMA_BASE_URL
+    from .config import OLLAMA_BASE_URL, is_codescope_instructor
     from .chat.connectivity import probe_ollama
 
     base_url = OLLAMA_BASE_URL.rstrip("/")
@@ -159,6 +165,25 @@ def _resolve_host_for_chat(llm_model: str) -> dict:
             f"[dim]Ollama:[/dim] [cyan]{base_url}[/cyan]  "
             f"[dim]({len(models)} models available)[/dim]"
         )
+        if is_codescope_instructor(llm_model) and llm_model not in models:
+            from .config import _PROFILE, codescope_base_model_for_profile
+            base = codescope_base_model_for_profile()
+            console.print(
+                f"[yellow]⚠  {llm_model!r} not installed.[/yellow] Rebuild for this machine:\n"
+                f"  [bold]ollama rm codescope[/bold]   # drop old 14b build if present\n"
+                f"  [bold]CODESCOPE_PROFILE={_PROFILE} python codescope/modelfiles/build.py[/bold]\n"
+                f"  (base: [cyan]{base}[/cyan])"
+            )
+        from .config import is_proscope_instructor
+        if is_proscope_instructor(llm_model) and llm_model not in models:
+            from .config import _PROFILE, codescope_base_model_for_profile
+            base = codescope_base_model_for_profile()
+            console.print(
+                f"[yellow]⚠  {llm_model!r} not installed.[/yellow] Build ProScope:\n"
+                f"  [bold]CODESCOPE_PROFILE={_PROFILE} python codescope/modelfiles/build.py "
+                f"--modelfile proscope.Modelfile --name proscope[/bold]\n"
+                f"  (base: [cyan]{base}[/cyan])"
+            )
     else:
         console.print(
             f"[yellow]⚠  Ollama not reachable at {base_url}[/yellow]\n"
@@ -858,12 +883,22 @@ def cmd_graph(
 def cmd_chat(
     project:       str  = _proj_opt(),
     new:           bool = typer.Option(False, "--new",  help="Force a new session"),
+    proscope:      bool = typer.Option(False, "--proscope", help="Product/architect mode (same as `codescope proscope`)"),
+    feature:       str  = typer.Option("", "--feature", "-f", help="Feature slug for docs/<slug>/ (ProScope)"),
     llm_model:     str  = _llm_opt(),
     embedder_name: str  = _embedder_opt(),
     verbose:       bool = _verbose_opt(),
     hitl:          bool = _hitl_opt(),
 ):
     """Start an interactive chat REPL for a project."""
+    if proscope:
+        from .config import PROSCOPE_OLLAMA_MODEL, DEFAULT_LLM
+        model = PROSCOPE_OLLAMA_MODEL if llm_model == DEFAULT_LLM else llm_model
+        _run_proscope_repl(
+            project, new, feature or None, model, embedder_name, verbose, hitl,
+        )
+        return
+
     host = _resolve_host_for_chat(llm_model)
 
     from . import projects as P
@@ -885,6 +920,57 @@ def cmd_chat(
         cache_dir=cache_dir, session_dir=session_dir,
         llm=llm, embedder=embedder,
         new_session=new, verbose=verbose, hitl_enabled=hitl,
+    )
+
+
+def _run_proscope_repl(
+    project: str,
+    new: bool,
+    feature: str | None,
+    llm_model: str,
+    embedder_name: str,
+    verbose: bool,
+    hitl: bool,
+) -> None:
+    host = _resolve_host_for_chat(llm_model)
+
+    from . import projects as P
+    from .models.llm import LLM
+    from .models.embedder import Embedder
+    from .chat.agent import repl
+
+    project_root = _resolve(project)
+    cache_dir    = P.cache_dir(project)
+    session_dir  = P.session_dir(project) / "proscope"
+    _check_index(project, cache_dir)
+
+    llm      = LLM(model=host["model"], base_url=host["base_url"], num_ctx=host["num_ctx"])
+    embedder = Embedder(model_name=embedder_name)
+    _check_ollama(llm)
+
+    repl(
+        slug=project, project_root=project_root,
+        cache_dir=cache_dir, session_dir=session_dir,
+        llm=llm, embedder=embedder,
+        new_session=new, verbose=verbose, hitl_enabled=hitl,
+        proscope=True,
+        feature_slug=feature,
+    )
+
+
+@app.command("proscope")
+def cmd_proscope(
+    project:       str  = _proj_opt(),
+    new:           bool = typer.Option(False, "--new",  help="Force a new session"),
+    feature:       str  = typer.Option("", "--feature", "-f", help="Feature slug, e.g. onboarding_simplification"),
+    llm_model:     str  = _proscope_llm_opt(),
+    embedder_name: str  = _embedder_opt(),
+    verbose:       bool = _verbose_opt(),
+    hitl:          bool = _hitl_opt(),
+):
+    """Product/architect mode — phased strategy docs in docs/ + reviewable code diffs."""
+    _run_proscope_repl(
+        project, new, feature or None, llm_model, embedder_name, verbose, hitl,
     )
 
 

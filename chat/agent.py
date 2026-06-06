@@ -31,35 +31,39 @@ from ..config import (
     PROMPT_FIELD_MAX_TOKENS,
     SYSTEM_PROMPT_TOKENS,
     WARM_MODEL_AT_REPL,
+    is_instructor_model,
 )
 from ..models.llm import LLM, OllamaError
 from ..models.embedder import Embedder
 from ..storage import sessions as session_store
 from ..storage.graph import GraphIndex
 from .context import build_graph_summary, count_tokens, truncate_to_tokens
+from .proscope_docs import (
+    format_feature_folder_list,
+    load_feature_docs_context,
+    persist_proscope_docs,
+    resolve_feature_slug,
+    save_active_feature,
+    slugify_feature,
+)
 from .tools import tool_grep, tool_read_file, tool_semantic_search, ToolError
 
 # --------------------------------------------------------------------------
 # Prompt
 # --------------------------------------------------------------------------
 
-SYSTEM = (
-    "You are codescope, a senior Android/Kotlin engineer answering questions and "
-    "making edits in a specific codebase. You are given a repo map (graph), the "
-    "full contents of the files the question is about, and semantically-related "
-    "code from elsewhere in the project.\n\n"
-    "Rules:\n"
-    "- Ground every answer in the provided files. Quote real symbol names, not guesses.\n"
-    "- If asked to edit/implement/fix a file, output the COMPLETE updated file inside a "
-    "single fenced code block, preceded by a heading line `### <path>`. Use the right "
-    "language tag (```kotlin / ```kt / ```xml / ```kts). codescope will convert your full "
-    "file into a git diff for the operator to review and apply — you never apply anything "
-    "yourself, so do NOT claim a change was made or written.\n"
-    "- Give the full file, not a snippet or ellipsis, so the diff is correct.\n"
-    "- If you only need to explain, answer in concise markdown and cite the relevant files.\n"
-    "- If the provided context is missing something you need, say so plainly instead of inventing it.\n"
-    "- Close every code fence. Do not leave a block open."
+# Fallback system prompt when --llm points at a raw base model (not codescope:latest).
+_SYSTEM_FALLBACK = (
+    "You are codescope, a senior Android/Kotlin engineer. Ground answers in the "
+    "provided context sections. For edits, output the complete file as "
+    "`### <path>` followed by a fenced code block; codescope converts it to a "
+    "git diff for the operator to apply — never claim you wrote anything."
 )
+
+
+def _system_for_model(model: str) -> str | None:
+    """Return None for Modelfile models so their baked-in SYSTEM is used."""
+    return None if is_instructor_model(model) else _SYSTEM_FALLBACK
 
 # Files / classes named in the query
 _CODE_EXTS = ("kt", "java", "xml", "kts", "gradle", "toml", "md")
@@ -244,13 +248,25 @@ def build_prompt(
     graph_summary: str,
     session_path: Path,
     print_fn: Callable[[str], None],
+    *,
+    proscope: bool = False,
+    feature_slug: str | None = None,
+    session_dir: Path | None = None,
 ) -> str:
+    label = "proscope" if proscope else "codescope"
+    active_feature = feature_slug
+    if proscope and session_dir is not None:
+        active_feature = resolve_feature_slug(query, project_root, session_dir, explicit=feature_slug)
+        if active_feature:
+            save_active_feature(session_dir, active_feature)
+            print_fn(f"[proscope] Feature: docs/{active_feature}/")
+
     # File lookup is mandatory.
     named = _resolve_named_files(query, project_root)
     if named:
-        print_fn(f"[codescope] Files: {', '.join(named)}")
+        print_fn(f"[{label}] Files: {', '.join(named)}")
     else:
-        print_fn("[codescope] No files named — relying on search + graph.")
+        print_fn(f"[{label}] No files named — relying on search + graph.")
 
     file_blocks: list[str] = []
     included: set[str] = set()
@@ -260,12 +276,18 @@ def build_prompt(
             file_blocks.append(f"### {rel}\n```\n{body}\n```")
             included.add(rel)
 
-    print_fn("[codescope] git · graph · search · grep…")
+    print_fn(f"[{label}] git · graph · search · grep…")
     git_info     = _git_context(project_root)
     neighborhood = _graph_neighborhood(named, cache_dir)
     neighbors    = _semantic_neighbors(query, cache_dir, embedder, exclude=included)
     usages       = _grep_usages(named, project_root)
     history      = _format_history(session_path)
+
+    feature_docs = ""
+    feature_list = ""
+    if proscope:
+        feature_docs = load_feature_docs_context(project_root, active_feature)
+        feature_list = format_feature_folder_list(project_root)
 
     # ── Budget ───────────────────────────────────────────────────────────────
     # Reserve the full write budget out of the context window FIRST, so that
@@ -292,6 +314,9 @@ def build_prompt(
 
     # Priority order. Files come right after the tiny git header.
     add("PROJECT STATE (git)", git_info, 0.05, 800)
+    if proscope:
+        add("FEATURE DOCUMENTATION (source of truth)", feature_docs, 0.18, 6_000)
+        add("PROSCOPE FEATURE FOLDERS", feature_list, 0.04, 800)
     if file_blocks:
         add("FILES IN QUESTION (full bodies)", "\n\n".join(file_blocks), 0.55, 24_000)
     add("GRAPH NEIGHBORHOOD (nearness)", neighborhood, 0.12, 4_000)
@@ -301,7 +326,14 @@ def build_prompt(
     add("RECENT CONVERSATION", history, 0.05, 1_200)
 
     context = "\n\n".join(parts)
-    return f"{context}\n\n=== QUESTION ===\n{query}"
+    suffix = query
+    if proscope and active_feature:
+        suffix = (
+            f"[Active feature folder: docs/{active_feature}/]\n"
+            f"Emit PROSCOPE_DOC blocks for docs/{active_feature}/ when planning or updating strategy.\n\n"
+            f"{query}"
+        )
+    return f"{context}\n\n=== QUESTION ===\n{suffix}"
 
 
 # --------------------------------------------------------------------------
@@ -318,19 +350,26 @@ def answer_turn(
     embedder: Embedder,
     graph_summary: str,
     print_fn: Callable[[str], None] = print,
+    *,
+    proscope: bool = False,
+    feature_slug: str | None = None,
 ) -> str:
     session_store.append_user(session_path, query)
 
     prompt = build_prompt(
         query, project_root, cache_dir, embedder, graph_summary, session_path, print_fn,
+        proscope=proscope,
+        feature_slug=feature_slug,
+        session_dir=session_dir,
     )
 
-    print_fn(f"[codescope] Generating with {llm.model} (num_predict={ANSWER_NUM_PREDICT_WRITE})…")
+    mode_label = "proscope" if proscope else "codescope"
+    print_fn(f"[{mode_label}] Generating with {llm.model} (num_predict={ANSWER_NUM_PREDICT_WRITE})…")
 
     try:
         answer = llm.generate(
             prompt=prompt,
-            system=SYSTEM,
+            system=_system_for_model(llm.model),
             json_mode=False,
             num_predict=ANSWER_NUM_PREDICT_WRITE,
             temperature=0.2,
@@ -341,6 +380,13 @@ def answer_turn(
         return msg
 
     answer = (answer or "").strip()
+
+    if proscope:
+        active = resolve_feature_slug(query, project_root, session_dir, explicit=feature_slug)
+        answer, _ = persist_proscope_docs(
+            answer, project_root, session_dir, active, print_fn=print_fn,
+        )
+
     answer = _propose_diffs(query, answer, project_root, cache_dir, print_fn)
     session_store.append_assistant(session_path, answer)
     return answer
@@ -471,6 +517,9 @@ def repl(
     verbose: bool = False,
     new_session: bool = False,
     hitl_enabled: bool = False,
+    *,
+    proscope: bool = False,
+    feature_slug: str | None = None,
 ) -> None:
     from rich.console import Console
     from rich.markdown import Markdown
@@ -479,6 +528,9 @@ def repl(
     session_dir.mkdir(parents=True, exist_ok=True)
     session_path = session_path or _open_session(session_dir, new_session)
     graph_summary = build_graph_summary(cache_dir)
+
+    if proscope and feature_slug:
+        save_active_feature(session_dir, slugify_feature(feature_slug))
 
     if not embedder.is_loaded():
         console.print(f"[dim]Loading embedding weights ({embedder.model_name} on {embedder.device})…[/dim]")
@@ -492,12 +544,21 @@ def repl(
         llm.warm()
 
     from ..config import OLLAMA_NUM_CTX, OLLAMA_BASE_URL
-    console.print(f"\n[bold green]codescope[/bold green] — project: [cyan]{slug}[/cyan]")
+    from .proscope_docs import load_active_feature
+
+    brand = "ProScope" if proscope else "codescope"
+    console.print(f"\n[bold magenta]{brand}[/bold magenta] — project: [cyan]{slug}[/cyan]")
     console.print(
         f"Session: [dim]{session_path.name}[/dim]  "
         f"Model: [dim]{llm.model}[/dim]  ctx: [dim]{OLLAMA_NUM_CTX:,}[/dim]  "
         f"[dim]{OLLAMA_BASE_URL}[/dim]"
     )
+    if proscope:
+        active = load_active_feature(session_dir)
+        console.print(
+            f"Feature docs: [cyan]docs/{active or '(none — use /feature <slug> or feature slug: …)'}[/cyan]\n"
+            f"[dim]ProScope writes docs/<feature>/IMPLEMENTATION_PLAN.md and STRATEGY_PHASE_*.md[/dim]"
+        )
     console.print("Type [bold]exit[/bold] or [bold]quit[/bold] to leave.\n")
 
     while True:
@@ -512,11 +573,20 @@ def repl(
             console.print("[dim]Goodbye.[/dim]")
             break
 
+        # ProScope REPL commands
+        if proscope and query.lower().startswith("/feature "):
+            slug = slugify_feature(query.split(maxsplit=1)[1])
+            save_active_feature(session_dir, slug)
+            console.print(f"[green]Active feature → docs/{slug}/[/green]\n")
+            continue
+
         answer = answer_turn(
             query, project_root, cache_dir, session_dir, session_path,
             llm, embedder, graph_summary, print_fn=console.print,
+            proscope=proscope,
+            feature_slug=None,
         )
-        console.print("\n[bold]codescope:[/bold]")
+        console.print(f"\n[bold]{brand}:[/bold]")
         try:
             console.print(Markdown(answer))
         except Exception:  # noqa: BLE001
@@ -534,6 +604,9 @@ def ask_once(
     embedder: Embedder,
     verbose: bool = False,
     hitl_enabled: bool = False,
+    *,
+    proscope: bool = False,
+    feature_slug: str | None = None,
 ) -> str:
     session_dir.mkdir(parents=True, exist_ok=True)
     session_path = session_store.new_path(session_dir)
@@ -541,4 +614,6 @@ def ask_once(
     return answer_turn(
         query, project_root, cache_dir, session_dir, session_path,
         llm, embedder, graph_summary, print_fn=print,
+        proscope=proscope,
+        feature_slug=feature_slug,
     )
